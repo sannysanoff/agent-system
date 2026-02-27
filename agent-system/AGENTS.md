@@ -1,0 +1,68 @@
+# Agents Reference
+
+This document catalogs reference projects and implementations relevant to building agent systems.
+
+## LangChain Go (langchaingo)
+
+**Location**: `../ref/langchaingo/`
+**Repository**: https://github.com/tmc/langchaingo
+**Documentation**: https://tmc.github.io/langchaingo/docs/
+**API Reference**: https://pkg.go.dev/github.com/tmc/langchaingo
+
+### Overview
+
+LangChain Go is the Go language implementation of the [LangChain](https://github.com/langchain-ai/langchain) framework. It provides a comprehensive set of tools for building applications with Large Language Models (LLMs) through composability.
+
+### Project Structure
+
+| Directory | Purpose |
+|-----------|---------|
+| `agents/` | Agent implementations (conversational, MRKL, OpenAI Functions) |
+| `chains/` | Chain implementations for composing LLM calls |
+| `tools/` | Tool implementations (calculator, search, database, etc.) |
+| `llms/` | LLM provider integrations (OpenAI, Anthropic, Ollama, etc.) |
+| `prompts/` | Prompt template management |
+| `memory/` | Memory components for conversation history |
+| `embeddings/` | Embedding model integrations |
+| `vectorstores/` | Vector database integrations |
+| `documentloaders/` | Document loading utilities |
+| `textsplitter/` | Text splitting utilities |
+| `outputparser/` | Output parsing utilities |
+| `callbacks/` | Callback handlers for observability |
+| `examples/` | Example implementations |
+
+### Key Components for Agent Systems
+
+#### Agent Types
+- **Conversational Agent**: Maintains conversation history
+- **MRKL Agent**: Uses ReAct pattern with tools
+- **OpenAI Functions Agent**: Leverages OpenAI function calling
+
+#### Tool Implementations Available
+- Calculator (arithmetic operations)
+- Search tools (DuckDuckGo, SerpAPI, Perplexity, Wikipedia)
+- Database tools (SQL database queries)
+- Web scraper
+- Zapier integration
+
+#### Chain Patterns
+- Sequential chains (multi-step workflows)
+- Constitutional chains (self-critique and refinement)
+- Retrieval QA (RAG implementations)
+- Conversational Retrieval QA
+- Map-reduce patterns
+- Summarization chains
+
+### Integration with This Project
+
+This agent-system project uses langchaingo for:
+- LLM abstraction layer
+- Tool execution framework
+- Agent loop patterns
+- Model provider integrations
+
+See the project [README.md](./README.md) for specific implementation details and configuration.
+
+### Full Documentation
+
+For complete documentation, examples, and API reference, see the [langchaingo README.md](../ref/langchaingo/README.md) in the reference directory.
