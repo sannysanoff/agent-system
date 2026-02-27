@@ -30,4 +30,4 @@ require (
 	github.com/pkoukk/tiktoken-go v0.1.6 // indirect
 )
 
-replace github.com/tmc/langchaingo => /Users/san/Fun/myclaude/ref/langchaingo
+replace github.com/tmc/langchaingo => ../ref/langchaingo
