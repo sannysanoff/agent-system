@@ -115,12 +115,23 @@ func LoadConfig(path string) (*AgentConfig, error) {
 		baseName = "config.yaml"
 	}
 
-	prompts.VerboseLog("config search: local_dir=%q app_dir=%q base_name=%q", localDir, appDir, baseName)
+	// Get user config directory
+	var userConfigDir string
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		userConfigDir = filepath.Join(homeDir, ".myagent")
+	}
 
-	basePath := findConfigPath(localDir, appDir, baseName)
-	overridePath := findConfigPath(localDir, appDir, "config.local.yaml")
+	prompts.VerboseLog("config search: local_dir=%q app_dir=%q user_dir=%q base_name=%q", localDir, appDir, userConfigDir, baseName)
+
+	basePath := findConfigPath(localDir, appDir, userConfigDir, baseName)
+	overridePath := findConfigPath(localDir, appDir, userConfigDir, "config.local.yaml")
 	if basePath == "" && overridePath == "" {
-		return nil, fmt.Errorf("failed to read config file: %s not found in %s or %s", baseName, localDir, appDir)
+		dirs := []string{localDir}
+		if userConfigDir != "" {
+			dirs = append(dirs, userConfigDir)
+		}
+		dirs = append(dirs, appDir)
+		return nil, fmt.Errorf("failed to read config file: %s not found in %s", baseName, strings.Join(dirs, ", "))
 	}
 
 	var mergedData []byte
@@ -130,7 +141,7 @@ func LoadConfig(path string) (*AgentConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read config file: %w", err)
 		}
-		mergedData, err = mergeConfigData(baseData, localDir, appDir)
+		mergedData, err = mergeConfigData(baseData, localDir, appDir, userConfigDir)
 		if err != nil {
 			return nil, err
 		}
@@ -195,9 +206,16 @@ func LoadConfig(path string) (*AgentConfig, error) {
 	return &config, nil
 }
 
-func findConfigPath(localDir, appDir, name string) string {
+func findConfigPath(localDir, appDir, userConfigDir, name string) string {
 	if localDir != "" {
 		candidate := filepath.Join(localDir, name)
+		prompts.VerboseLog("config check: %q", candidate)
+		if fileExists(candidate) {
+			return candidate
+		}
+	}
+	if userConfigDir != "" {
+		candidate := filepath.Join(userConfigDir, name)
 		prompts.VerboseLog("config check: %q", candidate)
 		if fileExists(candidate) {
 			return candidate
@@ -221,13 +239,13 @@ func fileExists(path string) bool {
 	return !info.IsDir()
 }
 
-func mergeConfigData(baseData []byte, localDir, appDir string) ([]byte, error) {
+func mergeConfigData(baseData []byte, localDir, appDir, userConfigDir string) ([]byte, error) {
 	var baseMap map[string]interface{}
 	if err := yaml.Unmarshal(baseData, &baseMap); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	overridePath := findConfigPath(localDir, appDir, "config.local.yaml")
+	overridePath := findConfigPath(localDir, appDir, userConfigDir, "config.local.yaml")
 	if overridePath == "" {
 		return baseData, nil
 	}
