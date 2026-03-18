@@ -162,7 +162,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		if !*rawOutput {
+		if !*rawOutput && !*jsonOutput {
 			fmt.Printf("\nTo resume this conversation: ./main -m %s -r %s\n", a.GetSessionID(), a.GetSessionID())
 		}
 		return
