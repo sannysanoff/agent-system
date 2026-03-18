@@ -1,5 +1,5 @@
 # Binaries
-agent
+/agent
 main
 *.exe
 *.exe~
