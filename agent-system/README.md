@@ -20,59 +20,128 @@ go mod tidy
 
 ## Configuration
 
-Create a `config.yaml` file:
+### Settings Format
+
+Configuration is defined in YAML format with three main sections:
+
+#### Variables Section
+
+Arbitrary key-value pairs that can be referenced elsewhere using `${VAR_NAME}` syntax:
 
 ```yaml
-default_model: "gpt-4"
+variables:
+  OPENAI_URL: "https://api.openai.com/v1"
+  AWS_REGION: "us-east-1"
+  API_KEY: "your-key-here"
+```
+
+#### Models Section
+
+Defines available LLM models with provider-specific settings:
+
+```yaml
+default_model: "nova-2-lite"
 
 models:
-  gpt-4:
-    name: "gpt-4"
-    provider: "openai"
-    model_id: "gpt-4"
-    api_key_env: "OPENAI_API_KEY"
-    max_tokens: 4096
+  my-model:
+    name: "Display Name"
+    provider: "bedrock"           # bedrock, openai, ollama, etc.
+    model_id: "model.identifier"
+    api_key: "${API_KEY}"         # or api_key_env: "ENV_VAR_NAME"
+    base_url: "https://api..."    # for openai provider
+    region: "${AWS_REGION}"       # for bedrock
+    aws_profile: "dev"            # for bedrock with SSO
+    max_tokens: 32768
     temperature: 0.7
+    soft_tools: true              # use soft tools mode
+    cache_points: false           # enable prompt caching
+```
 
+#### Tools Section
+
+Configures tool availability and behavior:
+
+```yaml
 tools:
   bash:
     enabled: true
     default_timeout_ms: 120000
-  
-  read:
-    enabled: true
-    max_lines: 2000
-  
-  write:
-    enabled: true
-  
-  edit:
-    enabled: true
-  
-  glob:
-    enabled: true
-    max_results: 1000
-  
+    allowed_commands: ["git", "ls"]  # optional whitelist
+    blocked_commands: ["rm", "dd"]   # optional blacklist
+
   grep:
     enabled: true
     max_results: 1000
-  
+    max_context_lines: 100
+
+  glob:
+    enabled: true
+    max_results: 1000
+
+  read:
+    enabled: true
+    read_limit: 80000
+
+  write:
+    enabled: true
+
+  edit:
+    enabled: true
+
   task:
     enabled: true
     default_model: "gpt-4"
     max_concurrent: 5
-  
+
   ask_user:
     enabled: true
-  
+
   webfetch:
     enabled: true
     timeout_secs: 30
-  
+
   websearch:
     enabled: true
     max_results: 8
+    timeout_secs: 30
 ```
+
+### File Location
+
+Configuration files are resolved in the following order:
+
+1. `config.yaml` - Base configuration (optional)
+2. `config.local.yaml` - Local overrides (optional)
+
+The system searches for these files in two locations (in order):
+
+- **Current working directory** - Checked first
+- **Binary directory** - Checked as fallback (where the executable is located)
+
+If both files exist, they are merged (local overrides take precedence). Variable interpolation occurs after merging, supporting:
+- Custom variables: `${MY_VAR}` from the `variables` section
+- Environment variables: `${env.ENV_NAME}` from the system environment
+
+### System Arguments
+
+| Flag | Shorthand | Description | Default |
+|------|-----------|-------------|---------|
+| `-config` | | Path to configuration file | `config.yaml` |
+| `-model` | `-m` | Model name to use (overrides default) | empty |
+| `-workdir` | | Working directory | current directory |
+| `-max-turns` | | Maximum agentic turns | `50` |
+| `-p` | | Single step prompt to execute | empty |
+| `-r` | | Resume conversation from session ID | empty |
+| `-json` | | Output in JSON format | `false` |
+| `-raw` | | Output only final response text (for scripting) | `false` |
+| `-no-session` | | Disable session saving | `false` |
+| `-tools` | | Tools to enable (comma-separated) | `DEFAULT` |
+| `-read-limit` | | Maximum bytes to read from a file | `80000` |
+
+#### Listing Options
+
+- List available models: `./agent -m` (without value)
+- List available tools: `./agent -tools` (without value)
 
 ## Usage
 
