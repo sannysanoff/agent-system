@@ -68,11 +68,13 @@ func (b *SystemPromptBuilder) BuildSystemPromptWithContext(projectRoot string) s
 		// Load global CLAUDE.md
 		prompt += b.LoadGlobalClaudeMD()
 
-		// Load project CLAUDE.md files
-		prompt += b.LoadProjectClaudeMD(projectRoot)
-
-		// Load AGENTS.md
-		prompt += b.LoadAgentsMD(projectRoot)
+		// Load AGENTS.md (project/global). If present, skip project CLAUDE.md files.
+		agentsContent := b.LoadAgentsMD(projectRoot)
+		prompt += agentsContent
+		if agentsContent == "" {
+			// Load project CLAUDE.md files only when AGENTS.md missing
+			prompt += b.LoadProjectClaudeMD(projectRoot)
+		}
 	}
 
 	VerboseLog("Built system prompt (%d chars)", len(prompt))

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,29 +12,22 @@ import (
 
 // ReadTool implements file reading functionality
 type ReadTool struct {
-	maxLines  int
-	chunkSize int
+	readLimit int
 }
 
 // ReadParams represents parameters for file reading
 type ReadParams struct {
 	FilePath string `json:"file_path"`
 	Offset   *int   `json:"offset,omitempty"`
-	Limit    *int   `json:"limit,omitempty"`
-	Pages    string `json:"pages,omitempty"` // For PDF files: "1-5", "3", "10-20"
 }
 
 // NewReadTool creates a new read tool
-func NewReadTool(maxLines, chunkSize int) *ReadTool {
-	if maxLines == 0 {
-		maxLines = 2000
-	}
-	if chunkSize == 0 {
-		chunkSize = 200
+func NewReadTool(readLimit int) *ReadTool {
+	if readLimit == 0 {
+		readLimit = 80000
 	}
 	return &ReadTool{
-		maxLines:  maxLines,
-		chunkSize: chunkSize,
+		readLimit: readLimit,
 	}
 }
 
@@ -44,7 +38,7 @@ func (t *ReadTool) Name() string {
 func (t *ReadTool) Description() string {
 	return "Reads a file from the local filesystem. You can access any file directly by using this tool. " +
 		"Assume this tool is able to read all files on the machine. It is okay to read a file that does not exist; " +
-		"an error will be returned. Supports reading specific line ranges."
+		"an error will be returned."
 }
 
 func (t *ReadTool) Schema() *ToolSchema {
@@ -58,14 +52,6 @@ func (t *ReadTool) Schema() *ToolSchema {
 			"offset": {
 				Type:        "integer",
 				Description: "The line number to start reading from (1-indexed). Only provide if the file is too large to read at once.",
-			},
-			"limit": {
-				Type:        "integer",
-				Description: "The number of lines to read. Only provide if the file is too large to read at once.",
-			},
-			"pages": {
-				Type:        "string",
-				Description: "Page range for PDF files (e.g., '1-5', '3', '10-20'). Only applicable to PDF files. Maximum 20 pages per request.",
 			},
 		},
 		Required: []string{"file_path"},
@@ -118,12 +104,6 @@ func (t *ReadTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 		return t.readDirectory(absPath)
 	}
 
-	// Handle PDF files
-	ext := strings.ToLower(filepath.Ext(absPath))
-	if ext == ".pdf" && readParams.Pages != "" {
-		return t.readPDFFile(absPath, readParams.Pages)
-	}
-
 	// Handle regular files
 	return t.readTextFile(absPath, readParams)
 }
@@ -162,80 +142,96 @@ func (t *ReadTool) readDirectory(path string) (ToolResult, error) {
 }
 
 func (t *ReadTool) readTextFile(path string, params ReadParams) (ToolResult, error) {
-	content, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return ToolResult{
 			Success: false,
-			Error:   fmt.Sprintf("failed to read file: %v", err),
+			Error:   fmt.Sprintf("failed to open file: %v", err),
 		}, nil
 	}
+	defer file.Close()
 
-	// Convert to lines
-	lines := strings.Split(string(content), "\n")
-	totalLines := len(lines)
-
-	// Determine offset and limit
 	offset := 1
 	if params.Offset != nil {
 		offset = *params.Offset
 	}
 
-	limit := t.maxLines
-	if params.Limit != nil {
-		limit = *params.Limit
+	var output strings.Builder
+	scanner := bufio.NewScanner(file)
+	currentLine := 0
+	totalLines := 0
+	linesReadStart := -1
+	linesReadEnd := -1
+	bytesRead := 0
+	limitReached := false
+
+	for scanner.Scan() {
+		totalLines++
+		currentLine = totalLines
+		line := scanner.Text()
+
+		if currentLine < offset {
+			continue
+		}
+
+		lineLen := len(line) + 1 // +1 for newline
+		if bytesRead+lineLen > t.readLimit {
+			limitReached = true
+			// Don't break yet, we want to count total lines
+			continue
+		}
+
+		if !limitReached {
+			if linesReadStart == -1 {
+				linesReadStart = currentLine
+			}
+			linesReadEnd = currentLine
+			output.WriteString(fmt.Sprintf("%d: %s\n", currentLine, line))
+			bytesRead += lineLen
+		}
 	}
 
-	// Validate range
-	if offset < 1 {
-		offset = 1
-	}
-	if offset > totalLines {
+	if err := scanner.Err(); err != nil {
 		return ToolResult{
 			Success: false,
-			Error:   fmt.Sprintf("offset %d exceeds file length of %d lines", offset, totalLines),
+			Error:   fmt.Sprintf("error reading file: %v", err),
 		}, nil
 	}
 
-	// Calculate end
-	end := offset + limit - 1
-	if end > totalLines {
-		end = totalLines
+	if linesReadStart == -1 && offset <= totalLines {
+		// This could happen if the first line we try to read is already larger than the limit
+		return ToolResult{
+			Success: false,
+			Error:   fmt.Sprintf("line %d is too large to read (limit: %d bytes)", offset, t.readLimit),
+		}, nil
 	}
 
-	// Extract lines
-	var output strings.Builder
-	for i := offset - 1; i < end; i++ {
-		lineNum := i + 1
-		output.WriteString(fmt.Sprintf("%d: %s\n", lineNum, lines[i]))
+	summary := fmt.Sprintf("lines read: %d-%d, total lines: %d, per-read limit: %d bytes",
+		linesReadStart, linesReadEnd, totalLines, t.readLimit)
+
+	if linesReadStart == -1 {
+		summary = fmt.Sprintf("no lines read, total lines: %d, per-read limit: %d bytes", totalLines, t.readLimit)
 	}
 
-	result := ToolResult{
-		Success: true,
-		Output:  output.String(),
-		Data: map[string]interface{}{
-			"type":        "file",
-			"path":        path,
-			"total_lines": totalLines,
-			"offset":      offset,
-			"limit":       limit,
-			"lines_read":  end - offset + 1,
-		},
+	resultOutput := output.String()
+	if resultOutput != "" {
+		resultOutput += "\n" + summary
+	} else {
+		resultOutput = summary
 	}
 
-	// Add truncation notice
-	if end < totalLines {
-		result.Data.(map[string]interface{})["truncated"] = true
-		result.Data.(map[string]interface{})["remaining_lines"] = totalLines - end
-	}
-
-	return result, nil
-}
-
-func (t *ReadTool) readPDFFile(path string, pages string) (ToolResult, error) {
-	// For now, return an error indicating PDF parsing is not implemented
-	// In a full implementation, you'd use a PDF library like pdfcpu or unidoc
 	return ToolResult{
-		Success: false,
-		Error:   "PDF reading not yet implemented. Use the file_path parameter to read other file types.",
+		Success: true,
+		Output:  resultOutput,
+		Data: map[string]interface{}{
+			"type":             "file",
+			"path":             path,
+			"total_lines":      totalLines,
+			"offset":           offset,
+			"lines_read_start": linesReadStart,
+			"lines_read_end":   linesReadEnd,
+			"bytes_read":       bytesRead,
+			"read_limit":       t.readLimit,
+		},
 	}, nil
 }

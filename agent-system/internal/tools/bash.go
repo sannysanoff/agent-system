@@ -181,13 +181,28 @@ func (t *BashTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 				Success: false,
 				Error:   fmt.Sprintf("command timed out after %v", timeout),
 				Output:  output,
+				Data: map[string]interface{}{
+					"stdout":    output,
+					"stderr":    stderrStr,
+					"exit_code": 124,
+				},
 			}, nil
+		}
+
+		exitCode := 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
 		}
 
 		return ToolResult{
 			Success: false,
 			Error:   fmt.Sprintf("command failed: %v", err),
 			Output:  output,
+			Data: map[string]interface{}{
+				"stdout":    output,
+				"stderr":    stderrStr,
+				"exit_code": exitCode,
+			},
 		}, nil
 	}
 

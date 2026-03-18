@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"agent-system/internal/prompts"
 	"gopkg.in/yaml.v3"
 )
 
@@ -61,8 +62,7 @@ type ToolConfig struct {
 
 	Read struct {
 		Enabled   bool `yaml:"enabled"`
-		MaxLines  int  `yaml:"max_lines,omitempty"`
-		ChunkSize int  `yaml:"chunk_size,omitempty"`
+		ReadLimit int  `yaml:"read_limit,omitempty"`
 	} `yaml:"read"`
 
 	Write struct {
@@ -105,25 +105,43 @@ func LoadConfig(path string) (*AgentConfig, error) {
 	localDir, _ := os.Getwd()
 	appDir := filepath.Dir(path)
 	baseName := filepath.Base(path)
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		appDir = filepath.Dir(exe)
+	}
 	if baseName == "." || baseName == "" {
 		baseName = "config.yaml"
 	}
 
+	prompts.VerboseLog("config search: local_dir=%q app_dir=%q base_name=%q", localDir, appDir, baseName)
+
 	basePath := findConfigPath(localDir, appDir, baseName)
-	if basePath == "" {
+	overridePath := findConfigPath(localDir, appDir, "config.local.yaml")
+	if basePath == "" && overridePath == "" {
 		return nil, fmt.Errorf("failed to read config file: %s not found in %s or %s", baseName, localDir, appDir)
 	}
 
-	baseData, err := os.ReadFile(basePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+	var mergedData []byte
+	if basePath != "" {
+		prompts.VerboseLog("config base found: %q", basePath)
+		baseData, err := os.ReadFile(basePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+		mergedData, err = mergeConfigData(baseData, localDir, appDir)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		prompts.VerboseLog("config base missing, using local override")
+		overrideData, err := os.ReadFile(overridePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config.local.yaml: %w", err)
+		}
+		mergedData = overrideData
 	}
-
-	mergedData, err := mergeConfigData(baseData, localDir, appDir)
-	if err != nil {
-		return nil, err
-	}
-
 	// First pass: extract variables
 	var varExtractor struct {
 		Variables map[string]string `yaml:"variables"`
@@ -150,11 +168,8 @@ func LoadConfig(path string) (*AgentConfig, error) {
 	if config.Tools.Glob.MaxResults == 0 {
 		config.Tools.Glob.MaxResults = 1000
 	}
-	if config.Tools.Read.MaxLines == 0 {
-		config.Tools.Read.MaxLines = 2000
-	}
-	if config.Tools.Read.ChunkSize == 0 {
-		config.Tools.Read.ChunkSize = 200
+	if config.Tools.Read.ReadLimit == 0 {
+		config.Tools.Read.ReadLimit = 80000
 	}
 	if config.Tools.Task.MaxConcurrent == 0 {
 		config.Tools.Task.MaxConcurrent = 5
@@ -183,12 +198,14 @@ func LoadConfig(path string) (*AgentConfig, error) {
 func findConfigPath(localDir, appDir, name string) string {
 	if localDir != "" {
 		candidate := filepath.Join(localDir, name)
+		prompts.VerboseLog("config check: %q", candidate)
 		if fileExists(candidate) {
 			return candidate
 		}
 	}
 	if appDir != "" {
 		candidate := filepath.Join(appDir, name)
+		prompts.VerboseLog("config check: %q", candidate)
 		if fileExists(candidate) {
 			return candidate
 		}
@@ -214,6 +231,7 @@ func mergeConfigData(baseData []byte, localDir, appDir string) ([]byte, error) {
 	if overridePath == "" {
 		return baseData, nil
 	}
+	prompts.VerboseLog("config override found: %q", overridePath)
 
 	overrideData, err := os.ReadFile(overridePath)
 	if err != nil {

@@ -1,6 +1,7 @@
 package subagent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/tmc/langchaingo/llms"
 
+	"agent-system/internal/prompts"
 	"agent-system/internal/tools"
 	"agent-system/internal/usage"
 )
@@ -193,9 +195,12 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 
 		// Add assistant message
 		contentParts := make([]llms.ContentPart, 0)
+		softToolError := len(choice.ToolCalls) == 0 && hasSoftToolMarkers(choice.Content)
 		if choice.Content != "" {
 			contentParts = append(contentParts, llms.TextContent{Text: choice.Content})
-			s.logfWithMeta("ASSISTANT", &currentUsage, nil, "%s\n", choice.Content)
+			if !softToolError {
+				s.logfWithMeta("ASSISTANT", &currentUsage, nil, "%s\n", choice.Content)
+			}
 		}
 		for _, tc := range choice.ToolCalls {
 			contentParts = append(contentParts, tc)
@@ -207,10 +212,30 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 
 		// Check for tool calls
 		if len(choice.ToolCalls) == 0 {
+			if softToolError {
+				s.addMessage(llms.MessageContent{
+					Role: llms.ChatMessageTypeTool,
+					Parts: []llms.ContentPart{
+						llms.ToolCallResponse{
+							ToolCallID: "soft_tool_error",
+							Content:    softToolFormatGuidance(),
+						},
+					},
+				})
+				continue
+			}
 			// No tool calls, return final response
 			return tools.SubAgentResult{
 				Success:   true,
 				Response:  choice.Content,
+				TurnsUsed: s.turnsUsed,
+			}, nil
+		}
+
+		if missingResponse := s.checkMissingToolParams(choice.ToolCalls); missingResponse != "" {
+			return tools.SubAgentResult{
+				Success:   false,
+				Response:  missingResponse,
 				TurnsUsed: s.turnsUsed,
 			}, nil
 		}
@@ -327,10 +352,11 @@ type ToolResultWithName struct {
 func (s *SubAgent) executeToolCalls(ctx context.Context, toolCalls []llms.ToolCall) []ToolResultWithName {
 	calls := make([]tools.ToolCall, len(toolCalls))
 	for i, tc := range toolCalls {
+		params := normalizeToolParams(tc.FunctionCall.Name, []byte(tc.FunctionCall.Arguments))
 		calls[i] = tools.ToolCall{
 			ID:     tc.ID,
 			Name:   tc.FunctionCall.Name,
-			Params: []byte(tc.FunctionCall.Arguments),
+			Params: params,
 		}
 	}
 
@@ -345,4 +371,189 @@ func (s *SubAgent) executeToolCalls(ctx context.Context, toolCalls []llms.ToolCa
 	}
 
 	return toolResults
+}
+
+func (s *SubAgent) checkMissingToolParams(toolCalls []llms.ToolCall) string {
+	for _, tc := range toolCalls {
+		tool, err := s.toolRegistry.Get(tc.FunctionCall.Name)
+		if err != nil {
+			continue
+		}
+		schema := tool.Schema()
+		if schema == nil || len(schema.Required) == 0 {
+			continue
+		}
+		params := normalizeToolParams(tc.FunctionCall.Name, []byte(tc.FunctionCall.Arguments))
+		missing := findMissingRequiredParams(schema.Required, params)
+		if len(missing) == 0 {
+			continue
+		}
+		return buildToolCallExample(tc.FunctionCall.Name, schema.Required)
+	}
+	return ""
+}
+
+func hasSoftToolMarkers(content string) bool {
+	return strings.Contains(content, "<tool_call>") || strings.Contains(content, "\"$tool_call\"")
+}
+
+func softToolFormatGuidance() string {
+	return "Tool call format invalid. Please respond with a JSON tool call like:\n\n```json\n{\"$tool_call\":\"bash\",\"$params\":{\"command\":\"...\",\"description\":\"...\"}}\n```\n\nConstruct the query inside the JSON string."
+}
+
+func findMissingRequiredParams(required []string, params []byte) []string {
+	if len(required) == 0 {
+		return nil
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return required
+	}
+	var missing []string
+	for _, key := range required {
+		value, ok := payload[key]
+		if !ok {
+			missing = append(missing, key)
+			continue
+		}
+		if str, ok := value.(string); ok && strings.TrimSpace(str) == "" {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+func buildToolCallExample(toolName string, required []string) string {
+	params := make(map[string]string, len(required))
+	for _, key := range required {
+		params[key] = "..."
+	}
+	example := map[string]interface{}{
+		"$tool_call": toolName,
+		"$params":    params,
+	}
+	serialized, _ := json.Marshal(example)
+	return fmt.Sprintf("Tool call is missing required parameters. Please respond with a JSON tool call like:\n\n```json\n%s\n```", string(serialized))
+}
+
+func normalizeToolParams(toolName string, params []byte) []byte {
+	trimmed := bytes.TrimSpace(params)
+	prompts.VerboseLog("tool params raw for %s: %q", toolName, string(trimmed))
+	if len(trimmed) == 0 {
+		return params
+	}
+	if json.Valid(trimmed) {
+		return params
+	}
+	if trimmed[0] == '"' {
+		var decoded string
+		if err := json.Unmarshal(trimmed, &decoded); err != nil {
+			return params
+		}
+		decodedBytes := bytes.TrimSpace([]byte(decoded))
+		if len(decodedBytes) == 0 {
+			return params
+		}
+		if json.Valid(decodedBytes) {
+			prompts.VerboseLog("tool params normalized from %q to %q", string(trimmed), string(decodedBytes))
+			return decodedBytes
+		}
+		recovered := attemptRecoverToolParams(toolName, string(decodedBytes))
+		if recovered != "" && json.Valid([]byte(recovered)) {
+			prompts.VerboseLog("tool params recovered for %s: %q", toolName, recovered)
+			return []byte(recovered)
+		}
+		return params
+	}
+	recovered := attemptRecoverToolParams(toolName, string(trimmed))
+	if recovered != "" && json.Valid([]byte(recovered)) {
+		prompts.VerboseLog("tool params recovered for %s: %q", toolName, recovered)
+		return []byte(recovered)
+	}
+	return params
+}
+
+func attemptRecoverToolParams(toolName, raw string) string {
+	if toolName != "bash" {
+		return ""
+	}
+
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if start := strings.Index(s, "{"); start != -1 {
+		if end := strings.LastIndex(s, "}"); end != -1 && end > start {
+			s = s[start : end+1]
+		}
+	}
+
+	command, ok := parseJSONField(s, "command")
+	if !ok || command == "" {
+		return ""
+	}
+
+	description := ""
+	if idx := strings.Index(raw, "<parameter=description>"); idx != -1 {
+		description = strings.TrimSpace(raw[idx+len("<parameter=description>"):])
+	}
+	if description == "" {
+		if descValue, ok := parseJSONField(s, "description"); ok {
+			description = descValue
+		}
+	}
+
+	payload := map[string]string{
+		"command": command,
+	}
+	if description != "" {
+		payload["description"] = description
+	}
+	serialized, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(serialized)
+}
+
+func parseJSONField(input, key string) (string, bool) {
+	idx := strings.Index(input, key)
+	if idx == -1 {
+		return "", false
+	}
+	colon := strings.Index(input[idx:], ":")
+	if colon == -1 {
+		return "", false
+	}
+	start := idx + colon + 1
+	for start < len(input) && (input[start] == ' ' || input[start] == '\n' || input[start] == '\t') {
+		start++
+	}
+	if start >= len(input) || input[start] != '"' {
+		return "", false
+	}
+	value, _, ok := parseJSONString(input, start)
+	return value, ok
+}
+
+func parseJSONString(input string, start int) (string, int, bool) {
+	if start >= len(input) || input[start] != '"' {
+		return "", start, false
+	}
+	var b strings.Builder
+	for i := start + 1; i < len(input); i++ {
+		switch input[i] {
+		case '\\':
+			if i+1 >= len(input) {
+				return "", i + 1, false
+			}
+			b.WriteByte(input[i+1])
+			i++
+		case '"':
+			return b.String(), i + 1, true
+		default:
+			b.WriteByte(input[i])
+		}
+	}
+	return "", len(input), false
 }
