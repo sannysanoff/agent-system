@@ -253,7 +253,8 @@ func checkIsGitRepo(dir string) bool {
 
 // resolveConfigPath resolves config file path in order:
 // 1. Current working directory
-// 2. Directory where the binary is located
+// 2. User config directory (~/.myagent/)
+// 3. Directory where the binary is located
 func resolveConfigPath(configFile string) (string, error) {
 	// If it's an absolute path, use it directly
 	if filepath.IsAbs(configFile) {
@@ -269,6 +270,18 @@ func resolveConfigPath(configFile string) (string, error) {
 				fmt.Printf("[VERBOSE] Using config from current dir: %s\n", cwdPath)
 			}
 			return filepath.Abs(cwdPath)
+		}
+	}
+
+	// Try user config directory ~/.myagent/
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		userConfigDir := filepath.Join(homeDir, ".myagent")
+		userConfigPath := filepath.Join(userConfigDir, configFile)
+		if _, err := os.Stat(userConfigPath); err == nil {
+			if prompts.IsVerbose() {
+				fmt.Printf("[VERBOSE] Using config from user dir: %s\n", userConfigPath)
+			}
+			return filepath.Abs(userConfigPath)
 		}
 	}
 
