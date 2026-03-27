@@ -49,12 +49,12 @@ type Agent struct {
 
 // AgentOptions represents options for creating an agent
 type AgentOptions struct {
-	ConfigPath string
-	ModelName  string
-	WorkingDir string
-	IsGitRepo  bool
-	MaxTurns   int
-	SessionID  string
+	ConfigPath   string
+	ModelName    string
+	WorkingDir   string
+	IsGitRepo    bool
+	MaxTurns     int
+	SessionID    string
 	JSONOutput   bool
 	RawOutput    bool
 	NoSession    bool
@@ -82,8 +82,11 @@ func NewAgent(options AgentOptions) (*Agent, error) {
 		return nil, fmt.Errorf("failed to create LLM: %w", err)
 	}
 
-	// Create prompt builder
-	promptBuilder := prompts.NewSystemPromptBuilder(options.WorkingDir, options.IsGitRepo)
+	// Determine which tools are enabled based on CLI and config
+	enabledToolsList := computeEnabledTools(options.EnabledTools, cfg)
+
+	// Create prompt builder with enabled tools
+	promptBuilder := prompts.NewSystemPromptBuilder(options.WorkingDir, options.IsGitRepo, enabledToolsList)
 
 	// Create tool registry
 	toolRegistry := tools.NewToolRegistry()
@@ -124,7 +127,7 @@ func NewAgent(options AgentOptions) (*Agent, error) {
 	}
 
 	// Register tools based on configuration
-	agent.registerTools(toolRegistry, cfg, options.WorkingDir, true, options.EnabledTools)
+	agent.registerTools(toolRegistry, cfg, options.WorkingDir, true, enabledToolsList)
 
 	if agent.maxTurns == 0 {
 		agent.maxTurns = 50
@@ -319,6 +322,51 @@ func findLastSession() (string, error) {
 	return lastSession, nil
 }
 
+// computeEnabledTools determines which tools are enabled based on CLI override and config
+func computeEnabledTools(cliEnabledTools []string, cfg *config.AgentConfig) []string {
+	// If CLI specifies tools, use those (unless it's "none" or "empty")
+	if len(cliEnabledTools) > 0 {
+		if len(cliEnabledTools) == 1 && (cliEnabledTools[0] == "none" || cliEnabledTools[0] == "empty") {
+			return []string{}
+		}
+		return cliEnabledTools
+	}
+
+	// Otherwise, use config-based enabling
+	var enabled []string
+	if cfg.Tools.Bash.Enabled {
+		enabled = append(enabled, "bash")
+	}
+	if cfg.Tools.Read.Enabled {
+		enabled = append(enabled, "read")
+	}
+	if cfg.Tools.Write.Enabled {
+		enabled = append(enabled, "write")
+	}
+	if cfg.Tools.Edit.Enabled {
+		enabled = append(enabled, "edit")
+	}
+	if cfg.Tools.Glob.Enabled {
+		enabled = append(enabled, "glob")
+	}
+	if cfg.Tools.Grep.Enabled {
+		enabled = append(enabled, "grep")
+	}
+	if cfg.Tools.AskUser.Enabled {
+		enabled = append(enabled, "ask_user_question")
+	}
+	if cfg.Tools.WebFetch.Enabled {
+		enabled = append(enabled, "webfetch")
+	}
+	if cfg.Tools.WebSearch.Enabled {
+		enabled = append(enabled, "websearch")
+	}
+	// task and skill are always enabled (they're core functionality)
+	enabled = append(enabled, "task", "skill")
+
+	return enabled
+}
+
 // registerTools registers all available tools with the registry
 func (a *Agent) registerTools(registry *tools.ToolRegistry, cfg *config.AgentConfig, workingDir string, includeAskUser bool, enabledTools []string) {
 	// If enabledTools is not empty, only tools in the list are enabled
@@ -440,6 +488,7 @@ func (a *Agent) registerTools(registry *tools.ToolRegistry, cfg *config.AgentCon
 					Tools:      subRegistry.GetAll(),
 					MaxTurns:   50,
 					JSONOutput: a.jsonOutput,
+					SoftTools:  a.modelConfig.SoftTools,
 				}
 				return subagent.NewSubAgent(subOpts), nil
 			},
@@ -630,8 +679,23 @@ func (a *Agent) runAgenticLoop(ctx context.Context) error {
 		if choice.Content != "" {
 			contentParts = append(contentParts, llms.TextContent{Text: choice.Content})
 		}
-		for _, tc := range choice.ToolCalls {
-			contentParts = append(contentParts, tc)
+		// For soft tools, embed tool calls in content as text instead of separate parts
+		if a.modelConfig.SoftTools && len(choice.ToolCalls) > 0 {
+			var sb strings.Builder
+			sb.WriteString(choice.Content)
+			for _, tc := range choice.ToolCalls {
+				if tc.FunctionCall != nil {
+					// Append tool_call_id to the existing content (which already has the JSON)
+					sb.WriteString(" as tool_call_id=")
+					sb.WriteString(tc.ID)
+				}
+			}
+			contentParts = []llms.ContentPart{llms.TextContent{Text: sb.String()}}
+		} else {
+			// Always add ToolCall parts so we have the IDs for serialization
+			for _, tc := range choice.ToolCalls {
+				contentParts = append(contentParts, tc)
+			}
 		}
 		a.addMessage(llms.MessageContent{
 			Role:  llms.ChatMessageTypeAI,

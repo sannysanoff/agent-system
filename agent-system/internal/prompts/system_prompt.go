@@ -11,18 +11,20 @@ import (
 
 // SystemPromptBuilder builds system prompts for the agent
 type SystemPromptBuilder struct {
-	workingDir string
-	isGitRepo  bool
+	workingDir   string
+	isGitRepo    bool
+	enabledTools []string
 }
 
 // NewSystemPromptBuilder creates a new system prompt builder
-func NewSystemPromptBuilder(workingDir string, isGitRepo bool) *SystemPromptBuilder {
+func NewSystemPromptBuilder(workingDir string, isGitRepo bool, enabledTools []string) *SystemPromptBuilder {
 	if workingDir == "" {
 		workingDir, _ = os.Getwd()
 	}
 	return &SystemPromptBuilder{
-		workingDir: workingDir,
-		isGitRepo:  isGitRepo,
+		workingDir:   workingDir,
+		isGitRepo:    isGitRepo,
+		enabledTools: enabledTools,
 	}
 }
 
@@ -399,25 +401,61 @@ Today's date: %s
 }
 
 func (b *SystemPromptBuilder) getBuiltInTools() string {
-	return `## Available Tools
+	// Define all available tools with their descriptions
+	allTools := []struct {
+		name        string
+		description string
+	}{
+		{"bash", "Executes bash commands with optional timeout"},
+		{"read", "Reads files from the filesystem with optional offset/limit"},
+		{"write", "Writes files to the filesystem"},
+		{"edit", "Performs exact string replacements in files"},
+		{"glob", "Fast file pattern matching with glob patterns"},
+		{"grep", "Powerful regex search tool"},
+		{"task", "Launch subagents for complex tasks"},
+		{"skill", "Execute a skill to load specialized domain knowledge"},
+		{"ask_user_question", "Ask the user questions during execution"},
+		{"webfetch", "Fetch content from URLs"},
+		{"websearch", "Search the web for information"},
+	}
 
-The following tools are available for use:
+	// Filter to only enabled tools
+	var enabled []struct {
+		name        string
+		description string
+	}
+	for _, tool := range allTools {
+		if b.isToolEnabled(tool.name) {
+			enabled = append(enabled, tool)
+		}
+	}
 
-1. **bash** - Executes bash commands with optional timeout
-2. **read** - Reads files from the filesystem with optional offset/limit
-3. **write** - Writes files to the filesystem
-4. **edit** - Performs exact string replacements in files
-5. **glob** - Fast file pattern matching with glob patterns
-6. **grep** - Powerful regex search tool
-7. **task** - Launch subagents for complex tasks
-8. **skill** - Execute a skill to load specialized domain knowledge
-9. **ask_user_question** - Ask the user questions during execution
-10. **webfetch** - Fetch content from URLs
-11. **websearch** - Search the web for information
+	if len(enabled) == 0 {
+		return ""
+	}
 
-Each tool has specific parameters - refer to the tool schema for details.
+	var sb strings.Builder
+	sb.WriteString("## Available Tools\n\n")
+	sb.WriteString("The following tools are available for use:\n\n")
+	for i, tool := range enabled {
+		sb.WriteString(fmt.Sprintf("%d. **%s** - %s\n", i+1, tool.name, tool.description))
+	}
+	sb.WriteString("\nEach tool has specific parameters - refer to the tool schema for details.\n\n")
+	return sb.String()
+}
 
-`
+// isToolEnabled checks if a tool is in the enabled list
+// If enabledTools is empty, all tools are considered enabled
+func (b *SystemPromptBuilder) isToolEnabled(name string) bool {
+	if len(b.enabledTools) == 0 {
+		return true
+	}
+	for _, enabled := range b.enabledTools {
+		if enabled == name {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadProjectClaudeMD loads project-specific CLAUDE.md if it exists

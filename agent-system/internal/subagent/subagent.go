@@ -30,6 +30,7 @@ type SubAgent struct {
 	maxTurns     int
 	turnsUsed    int
 	jsonOutput   bool
+	softTools    bool
 }
 
 // SubAgentOptions represents options for creating a subagent
@@ -41,6 +42,7 @@ type SubAgentOptions struct {
 	Tools      []tools.Tool
 	MaxTurns   int
 	JSONOutput bool
+	SoftTools  bool
 }
 
 // NewSubAgent creates a new subagent
@@ -58,14 +60,13 @@ func NewSubAgent(options SubAgentOptions) *SubAgent {
 	return &SubAgent{
 		id:           id,
 		parentID:     options.ParentID,
-		sessionID:    fmt.Sprintf("%s-subagent-%s", options.ParentID, id),
+		sessionID:    id,
 		agentType:    options.AgentType,
 		llm:          options.LLM,
 		toolRegistry: registry,
-		conversation: make([]llms.MessageContent, 0),
 		maxTurns:     options.MaxTurns,
-		turnsUsed:    0,
 		jsonOutput:   options.JSONOutput,
+		softTools:    options.SoftTools,
 	}
 }
 
@@ -202,6 +203,7 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 				s.logfWithMeta("ASSISTANT", &currentUsage, nil, "%s\n", choice.Content)
 			}
 		}
+		// Always add ToolCall parts so we have the IDs for serialization
 		for _, tc := range choice.ToolCalls {
 			contentParts = append(contentParts, tc)
 		}
