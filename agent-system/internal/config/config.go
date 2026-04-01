@@ -29,6 +29,7 @@ type ModelConfig struct {
 	AWSProfile   string            `yaml:"aws_profile,omitempty"`   // For Bedrock
 	SoftTools    bool              `yaml:"soft_tools,omitempty"`    // Enable soft tools mode
 	CachePoints  bool              `yaml:"cache_points,omitempty"`  // Enable cache points for Nova models
+	Format       string            `yaml:"format,omitempty"`        // Request format: "openai" or "nova" (default: openai)
 }
 
 // AgentConfig represents the main configuration structure

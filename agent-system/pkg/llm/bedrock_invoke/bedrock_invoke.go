@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"agent-system/internal/config"
+	"agent-system/internal/prompts"
 	"agent-system/internal/usage"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -124,32 +127,57 @@ func (m *BedrockInvokeModel) GenerateContent(ctx context.Context, messages []llm
 	var reqBody []byte
 	var err error
 
-	isOpenAICompat := strings.Contains(m.modelConfig.ModelID, "nemotron") || strings.Contains(m.modelConfig.ModelID, "openai")
+	// Determine format: use config Format field, or guess from model ID, default to openai
+	format := m.modelConfig.Format
+	if format == "" {
+		// Backward compatibility: guess from model ID
+		if strings.Contains(m.modelConfig.ModelID, "nemotron") || strings.Contains(m.modelConfig.ModelID, "openai") {
+			format = "openai"
+		} else if strings.Contains(m.modelConfig.ModelID, "nova") {
+			format = "nova"
+		} else {
+			format = "openai" // Default
+		}
+	}
+	isOpenAICompat := format == "openai"
 
 	// If the model is Nemotron or OpenAI-compatible (e.g. GPT-OSS), use OpenAI format
 	if isOpenAICompat {
+		type oaiContent struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
 		type oaiCompatMessage struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
+			Role    string       `json:"role"`
+			Content []oaiContent `json:"content"`
+		}
+		type oaiCompatTool struct {
+			Type     string                 `json:"type"`
+			Function map[string]interface{} `json:"function"`
 		}
 		type oaiCompatRequest struct {
 			Messages    []oaiCompatMessage `json:"messages"`
 			MaxTokens   int                `json:"max_tokens,omitempty"`
 			Temperature float64            `json:"temperature,omitempty"`
+			Tools       []oaiCompatTool    `json:"tools,omitempty"`
+			ToolChoice  interface{}        `json:"tool_choice,omitempty"`
 		}
 
 		var oaiMessages []oaiCompatMessage
 		if systemPrompt != "" {
-			oaiMessages = append(oaiMessages, oaiCompatMessage{Role: "system", Content: systemPrompt})
+			oaiMessages = append(oaiMessages, oaiCompatMessage{
+				Role:    "system",
+				Content: []oaiContent{{Type: "text", Text: systemPrompt}},
+			})
 		}
 		for _, msg := range bedrockMessages {
-			content := ""
+			var contents []oaiContent
 			for _, c := range msg.Content {
-				content += c.Text
+				contents = append(contents, oaiContent{Type: "text", Text: c.Text})
 			}
 			oaiMessages = append(oaiMessages, oaiCompatMessage{
 				Role:    msg.Role,
-				Content: content,
+				Content: contents,
 			})
 		}
 
@@ -159,8 +187,47 @@ func (m *BedrockInvokeModel) GenerateContent(ctx context.Context, messages []llm
 			Temperature: opts.Temperature,
 		}
 
+		// Add tools if provided
+		if len(opts.Tools) > 0 {
+			for _, tool := range opts.Tools {
+				if tool.Type == "function" && tool.Function != nil {
+					funcDef := map[string]interface{}{
+						"name":        tool.Function.Name,
+						"description": tool.Function.Description,
+					}
+					if tool.Function.Parameters != nil {
+						funcDef["parameters"] = tool.Function.Parameters
+					}
+					oaiReq.Tools = append(oaiReq.Tools, oaiCompatTool{
+						Type:     "function",
+						Function: funcDef,
+					})
+				}
+			}
+			if opts.ToolChoice != nil {
+				oaiReq.ToolChoice = opts.ToolChoice
+			}
+		}
+
 		reqBody, err = json.Marshal(oaiReq)
 	} else {
+		// Nova format with toolConfig
+		type novaToolInputSchema struct {
+			JSON map[string]interface{} `json:"json"`
+		}
+		type novaToolSpec struct {
+			Name        string              `json:"name"`
+			Description string              `json:"description"`
+			InputSchema novaToolInputSchema `json:"inputSchema"`
+		}
+		type novaTool struct {
+			ToolSpec novaToolSpec `json:"toolSpec"`
+		}
+		type novaToolConfig struct {
+			Tools      []novaTool  `json:"tools"`
+			ToolChoice interface{} `json:"toolChoice,omitempty"`
+		}
+
 		novaReq := novaRequest{
 			Messages: bedrockMessages,
 			InferenceConfig: &novaInferenceConfig{
@@ -172,6 +239,42 @@ func (m *BedrockInvokeModel) GenerateContent(ctx context.Context, messages []llm
 		if systemPrompt != "" {
 			novaReq.System = []novaContent{{Text: systemPrompt}}
 		}
+
+		// Add tools if provided
+		if len(opts.Tools) > 0 {
+			var tools []novaTool
+			for _, tool := range opts.Tools {
+				if tool.Type == "function" && tool.Function != nil {
+					schema := map[string]interface{}{
+						"type":       "object",
+						"properties": map[string]interface{}{},
+					}
+					if tool.Function.Parameters != nil {
+						// Convert parameters to map
+						paramsJSON, _ := json.Marshal(tool.Function.Parameters)
+						var paramsMap map[string]interface{}
+						json.Unmarshal(paramsJSON, &paramsMap)
+						schema = paramsMap
+					}
+					tools = append(tools, novaTool{
+						ToolSpec: novaToolSpec{
+							Name:        tool.Function.Name,
+							Description: tool.Function.Description,
+							InputSchema: novaToolInputSchema{JSON: schema},
+						},
+					})
+				}
+			}
+			if len(tools) > 0 {
+				toolConfig := novaToolConfig{Tools: tools}
+				if opts.ToolChoice != nil {
+					toolConfig.ToolChoice = opts.ToolChoice
+				}
+				// Marshal toolConfig and add to request
+				novaReq.ToolConfig = &toolConfig
+			}
+		}
+
 		reqBody, err = json.Marshal(novaReq)
 	}
 	if err != nil {
@@ -182,6 +285,9 @@ func (m *BedrockInvokeModel) GenerateContent(ctx context.Context, messages []llm
 		fmt.Printf("DEBUG: Bedrock Request Body: %s\n", string(reqBody))
 	}
 
+	callID := time.Now().UnixMilli()
+	callStartTime := time.Now()
+
 	input := &bedrockruntime.InvokeModelInput{
 		ModelId:     &m.modelConfig.ModelID,
 		ContentType: stringPtr("application/json"),
@@ -189,7 +295,54 @@ func (m *BedrockInvokeModel) GenerateContent(ctx context.Context, messages []llm
 		Body:        reqBody,
 	}
 
+	// Dump verbose logs if enabled
+	if prompts.IsVerbose() {
+		dumpDir := "/tmp/bedrock-invoke"
+		if err := os.MkdirAll(dumpDir, 0755); err == nil {
+			// Build free-form request dump
+			var reqDump strings.Builder
+			reqDump.WriteString(fmt.Sprintf("Call ID: %d\n", callID))
+			reqDump.WriteString(fmt.Sprintf("Timestamp: %s\n", callStartTime.UTC().Format(time.RFC3339Nano)))
+			reqDump.WriteString(fmt.Sprintf("Model ID: %s\n", m.modelConfig.ModelID))
+			reqDump.WriteString(fmt.Sprintf("Region: %s\n", m.modelConfig.Region))
+			reqDump.WriteString(fmt.Sprintf("AWS Profile: %s\n", m.modelConfig.AWSProfile))
+			reqDump.WriteString(fmt.Sprintf("Format: %s\n", format))
+			reqDump.WriteString(fmt.Sprintf("Temperature: %.2f\n", opts.Temperature))
+			reqDump.WriteString(fmt.Sprintf("Max Tokens: %d\n", opts.MaxTokens))
+			reqDump.WriteString(fmt.Sprintf("Number of Tools: %d\n", len(opts.Tools)))
+			if len(opts.Tools) > 0 {
+				reqDump.WriteString("\n--- Tools ---\n")
+				for i, tool := range opts.Tools {
+					reqDump.WriteString(fmt.Sprintf("Tool %d:\n", i))
+					reqDump.WriteString(fmt.Sprintf("  Type: %s\n", tool.Type))
+					if tool.Function != nil {
+						reqDump.WriteString(fmt.Sprintf("  Name: %s\n", tool.Function.Name))
+						reqDump.WriteString(fmt.Sprintf("  Description: %s\n", tool.Function.Description))
+						if tool.Function.Parameters != nil {
+							paramsJSON, _ := json.MarshalIndent(tool.Function.Parameters, "    ", "  ")
+							reqDump.WriteString(fmt.Sprintf("  Parameters:\n    %s\n", string(paramsJSON)))
+						}
+					}
+				}
+			}
+			if opts.ToolChoice != nil {
+				reqDump.WriteString(fmt.Sprintf("Tool Choice: %v\n", opts.ToolChoice))
+			}
+			reqDump.WriteString("\n--- Request Body (JSON) ---\n")
+			reqDump.WriteString(string(reqBody))
+			reqDump.WriteString("\n\n--- InvokeModelInput ---\n")
+			reqDump.WriteString(fmt.Sprintf("ModelId: %s\n", *input.ModelId))
+			reqDump.WriteString(fmt.Sprintf("ContentType: %s\n", *input.ContentType))
+			reqDump.WriteString(fmt.Sprintf("Accept: %s\n", *input.Accept))
+			reqDump.WriteString(fmt.Sprintf("Body length: %d bytes\n", len(input.Body)))
+
+			reqFile := filepath.Join(dumpDir, fmt.Sprintf("%d.request", callID))
+			os.WriteFile(reqFile, []byte(reqDump.String()), 0644)
+		}
+	}
+
 	result, err := m.client.InvokeModel(ctx, input)
+	callDuration := time.Since(callStartTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to invoke model: %w", err)
 	}
@@ -201,15 +354,50 @@ func (m *BedrockInvokeModel) GenerateContent(ctx context.Context, messages []llm
 		fmt.Printf("DEBUG: Bedrock Response Body: %s\n", string(result.Body))
 	}
 
+	// Dump response to same file if verbose
+	if prompts.IsVerbose() {
+		dumpDir := "/tmp/bedrock-invoke"
+		respTime := time.Now()
+
+		var respDump strings.Builder
+		respDump.WriteString("\n\n===== RESPONSE =====\n\n")
+		respDump.WriteString(fmt.Sprintf("Response Timestamp: %s\n", respTime.UTC().Format(time.RFC3339Nano)))
+		respDump.WriteString(fmt.Sprintf("Call Duration: %s (%.3f seconds)\n", callDuration, callDuration.Seconds()))
+		respDump.WriteString("\n--- Response Body (JSON) ---\n")
+		respDump.WriteString(string(result.Body))
+
+		// Append to the same request file
+		reqFile := filepath.Join(dumpDir, fmt.Sprintf("%d.request", callID))
+		f, err := os.OpenFile(reqFile, os.O_APPEND|os.O_WRONLY, 0644)
+		if err == nil {
+			f.WriteString(respDump.String())
+			f.Close()
+		}
+	}
+
 	if isOpenAICompat {
 		// Nemotron/GPT-OSS returns an OpenAI-compatible response
+		type openAIFunction struct {
+			Arguments string `json:"arguments"`
+			Name      string `json:"name"`
+		}
+		type openAIToolCall struct {
+			Function openAIFunction `json:"function"`
+			ID       string         `json:"id"`
+			Type     string         `json:"type"`
+		}
+		type openAIMessage struct {
+			Content   string           `json:"content"`
+			ToolCalls []openAIToolCall `json:"tool_calls,omitempty"`
+			Role      string           `json:"role"`
+		}
+		type openAIChoice struct {
+			FinishReason string        `json:"finish_reason"`
+			Message      openAIMessage `json:"message"`
+		}
 		type openAIResponse struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-			Usage struct {
+			Choices []openAIChoice `json:"choices"`
+			Usage   struct {
 				PromptTokens     int `json:"prompt_tokens"`
 				CompletionTokens int `json:"completion_tokens"`
 			} `json:"usage"`
@@ -219,10 +407,45 @@ func (m *BedrockInvokeModel) GenerateContent(ctx context.Context, messages []llm
 			return nil, fmt.Errorf("failed to unmarshal nemotron response: %w. Body: %s", err, string(result.Body))
 		}
 		if len(oaiResp.Choices) > 0 {
-			content = oaiResp.Choices[0].Message.Content
+			choice := oaiResp.Choices[0]
+			content = choice.Message.Content
+			inputTokens = oaiResp.Usage.PromptTokens
+			outputTokens = oaiResp.Usage.CompletionTokens
+
+			// Build ContentChoice with tool calls
+			contentChoice := &llms.ContentChoice{
+				Content: content,
+				GenerationInfo: map[string]interface{}{
+					"Usage": usage.Usage{
+						InputTokens:  inputTokens,
+						OutputTokens: outputTokens,
+					},
+				},
+			}
+
+			// Parse tool calls
+			for _, tc := range choice.Message.ToolCalls {
+				if tc.Type == "function" {
+					contentChoice.ToolCalls = append(contentChoice.ToolCalls, llms.ToolCall{
+						ID:   tc.ID,
+						Type: tc.Type,
+						FunctionCall: &llms.FunctionCall{
+							Name:      tc.Function.Name,
+							Arguments: tc.Function.Arguments,
+						},
+					})
+				}
+			}
+
+			// Set legacy FuncCall for backwards compatibility
+			if len(contentChoice.ToolCalls) > 0 {
+				contentChoice.FuncCall = contentChoice.ToolCalls[0].FunctionCall
+			}
+
+			return &llms.ContentResponse{
+				Choices: []*llms.ContentChoice{contentChoice},
+			}, nil
 		}
-		inputTokens = oaiResp.Usage.PromptTokens
-		outputTokens = oaiResp.Usage.CompletionTokens
 	} else {
 		var novaResp novaResponse
 		if err := json.Unmarshal(result.Body, &novaResp); err != nil {
@@ -262,9 +485,10 @@ func (m *BedrockInvokeModel) Call(ctx context.Context, prompt string, options ..
 
 // Internal structures for Nova
 type novaRequest struct {
-	Messages        []novaMessage       `json:"messages"`
+	Messages        []novaMessage        `json:"messages"`
 	InferenceConfig *novaInferenceConfig `json:"inferenceConfig,omitempty"`
-	System          []novaContent       `json:"system,omitempty"`
+	System          []novaContent        `json:"system,omitempty"`
+	ToolConfig      interface{}          `json:"toolConfig,omitempty"`
 }
 
 type novaMessage struct {
