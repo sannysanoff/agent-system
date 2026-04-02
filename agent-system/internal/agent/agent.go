@@ -114,11 +114,13 @@ func NewAgent(options AgentOptions) (*Agent, error) {
 	} else if agent.sessionID == "last" {
 		lastID, err := findLastSession()
 		if err != nil {
-			return nil, fmt.Errorf("failed to find last session: %w", err)
-		}
-		agent.sessionID = lastID
-		if err := agent.loadSession(); err != nil {
-			return nil, fmt.Errorf("failed to load last session %s: %w", agent.sessionID, err)
+			// No sessions found, silently start a new session
+			agent.sessionID = uuid.New().String()
+		} else {
+			agent.sessionID = lastID
+			if err := agent.loadSession(); err != nil {
+				return nil, fmt.Errorf("failed to load last session %s: %w", agent.sessionID, err)
+			}
 		}
 	} else {
 		if err := agent.loadSession(); err != nil {
