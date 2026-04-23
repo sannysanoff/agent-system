@@ -492,6 +492,15 @@ func (a *Agent) registerTools(registry *tools.ToolRegistry, cfg *config.AgentCon
 					JSONOutput: a.jsonOutput,
 					SoftTools:  a.modelConfig.SoftTools,
 				}
+
+				// If fork is enabled, pass the parent's conversation
+				if config.Fork && len(config.Conversation) > 0 {
+					var conversation []llms.MessageContent
+					if err := json.Unmarshal(config.Conversation, &conversation); err == nil {
+						subOpts.Conversation = conversation
+					}
+				}
+
 				return subagent.NewSubAgent(subOpts), nil
 			},
 		)
@@ -730,7 +739,7 @@ func (a *Agent) runAgenticLoop(ctx context.Context) error {
 			}
 		}
 
-		// Execute tool calls
+		// Execute tool calls in parallel and wait for ALL to complete
 		toolResults := a.executeToolCalls(ctx, choice.ToolCalls)
 
 		// Check for malformed tool calls and provide correction feedback
@@ -762,7 +771,9 @@ func (a *Agent) runAgenticLoop(ctx context.Context) error {
 			continue // Continue the loop to give the model another chance
 		}
 
-		// Add tool results to conversation
+		// Add ALL tool results to conversation as a batch
+		// This ensures the LLM waits for all parallel tool calls to complete
+		// before making its next decision
 		for i, result := range toolResults {
 			resultJSON, _ := json.Marshal(result.Result)
 			// For task tool, if it was a success, try to extract the subagent ID for JSON logging

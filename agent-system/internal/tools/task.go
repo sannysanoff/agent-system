@@ -41,6 +41,8 @@ type SubAgentConfig struct {
 	SubagentType string `json:"subagent_type"`
 	Model        string `json:"model,omitempty"`
 	ParentID     string `json:"parent_id,omitempty"`
+	Fork         bool   `json:"fork,omitempty"`
+	Conversation []byte `json:"conversation,omitempty"` // Serialized conversation when forking
 }
 
 // TaskParams represents parameters for task execution
@@ -52,6 +54,7 @@ type TaskParams struct {
 	Resume          string `json:"resume,omitempty"`
 	RunInBackground bool   `json:"run_in_background,omitempty"`
 	MaxTurns        *int   `json:"max_turns,omitempty"`
+	Fork            bool   `json:"fork,omitempty"` // When true, subagent forks parent's conversation (gets copy with new GUID)
 }
 
 // NewTaskTool creates a new task tool
@@ -108,13 +111,17 @@ func (t *TaskTool) Schema() *ToolSchema {
 				Type:        "boolean",
 				Description: "Set to true to run this agent in the background",
 			},
-			"max_turns": {
-				Type:        "integer",
-				Description: "Maximum number of agentic turns before stopping",
-			},
+		"max_turns": {
+			Type:        "integer",
+			Description: "Maximum number of agentic turns before stopping",
 		},
-		Required: []string{"description", "prompt", "subagent_type"},
-	}
+		"fork": {
+			Type:        "boolean",
+			Description: "When true, the subagent forks (copies) the parent's conversation history with a new GUID. Use when launching multiple parallel subagents to research different things simultaneously.",
+		},
+	},
+	Required: []string{"description", "prompt", "subagent_type"},
+}
 }
 
 func (t *TaskTool) Execute(ctx context.Context, params json.RawMessage) (ToolResult, error) {
@@ -182,11 +189,13 @@ func (t *TaskTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 		return t.resumeAgent(ctx, taskParams.Resume)
 	}
 
-	// Create subagent
+	// Create subagent config
 	agentConfig := SubAgentConfig{
 		SubagentType: taskParams.SubagentType,
 		Model:        model,
 		ParentID:     t.parentID,
+		Fork:         taskParams.Fork,
+		// Note: Conversation will be populated by agentFactory if Fork is true
 	}
 
 	agent, err := t.agentFactory(agentConfig)

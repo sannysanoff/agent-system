@@ -35,14 +35,15 @@ type SubAgent struct {
 
 // SubAgentOptions represents options for creating a subagent
 type SubAgentOptions struct {
-	ID         string
-	ParentID   string
-	AgentType  string
-	LLM        llms.Model
-	Tools      []tools.Tool
-	MaxTurns   int
-	JSONOutput bool
-	SoftTools  bool
+	ID           string
+	ParentID     string
+	AgentType    string
+	LLM          llms.Model
+	Tools        []tools.Tool
+	MaxTurns     int
+	JSONOutput   bool
+	SoftTools    bool
+	Conversation []llms.MessageContent // Forked conversation from parent (when fork=true)
 }
 
 // NewSubAgent creates a new subagent
@@ -57,6 +58,14 @@ func NewSubAgent(options SubAgentOptions) *SubAgent {
 		id = uuid.New().String()
 	}
 
+	// Initialize conversation - use forked conversation if provided, otherwise empty
+	conversation := make([]llms.MessageContent, 0)
+	if len(options.Conversation) > 0 {
+		// Fork the parent's conversation (creates a copy)
+		conversation = make([]llms.MessageContent, len(options.Conversation))
+		copy(conversation, options.Conversation)
+	}
+
 	return &SubAgent{
 		id:           id,
 		parentID:     options.ParentID,
@@ -64,6 +73,7 @@ func NewSubAgent(options SubAgentOptions) *SubAgent {
 		agentType:    options.AgentType,
 		llm:          options.LLM,
 		toolRegistry: registry,
+		conversation: conversation,
 		maxTurns:     options.MaxTurns,
 		jsonOutput:   options.JSONOutput,
 		softTools:    options.SoftTools,
@@ -159,7 +169,12 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 
 	// Initialize conversation
 	if len(s.conversation) == 0 {
+		// Fresh conversation - add system prompt and user prompt
 		s.addMessage(llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt))
+		s.addMessage(llms.TextParts(llms.ChatMessageTypeHuman, prompt))
+	} else {
+		// Forked conversation - conversation already has parent's history
+		// Append the new user prompt to continue from where parent left off
 		s.addMessage(llms.TextParts(llms.ChatMessageTypeHuman, prompt))
 	}
 
