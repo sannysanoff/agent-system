@@ -1118,8 +1118,8 @@ func (a *Agent) RunSingle(ctx context.Context, prompt string) error {
 	if a.outputFile != "" && a.finalResponse != "" {
 		if err := os.WriteFile(a.outputFile, []byte(a.finalResponse), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing output file: %v\n", err)
-		} else if !a.jsonOutput && !a.rawOutput {
-			fmt.Printf("\nOutput written to: %s\n", a.outputFile)
+		} else {
+			fmt.Fprintf(os.Stderr, "\nOutput written to: %s\n", a.outputFile)
 		}
 	}
 

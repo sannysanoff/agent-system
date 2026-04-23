@@ -33,7 +33,7 @@ func main() {
 		readLimit      = flag.Int("read-limit", 80000, "Maximum bytes to read from a file")
 		agentName      = flag.String("a", "", "Agent name to load default prompt from .claude/agents/ (use -a alone to list agents)")
 		debugPrompt    = flag.Bool("debug-prompt", false, "Dump system prompt and initial user prompt, then exit")
-		outputFile     = flag.String("out", "", "Write final assistant response to file (no thinking, no tool calls)")
+		outputFile     = flag.String("out", "", "Also write final assistant response to file (no thinking, no tool calls). Does not suppress stdout.")
 	)
 
 	// Custom flag parsing for -tools
