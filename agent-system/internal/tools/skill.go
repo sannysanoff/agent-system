@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 type SkillTool struct {
@@ -64,7 +66,7 @@ func (t *SkillTool) Execute(ctx context.Context, params json.RawMessage) (ToolRe
 		}, nil
 	}
 
-	content, err := t.loadSkill(skillName)
+	content, skillPath, err := t.loadSkill(skillName)
 	if err != nil {
 		return ToolResult{
 			Success: false,
@@ -72,44 +74,52 @@ func (t *SkillTool) Execute(ctx context.Context, params json.RawMessage) (ToolRe
 		}, nil
 	}
 
+	output := content + fmt.Sprintf("\n\nIMPORTANT: skill is loaded from file: %s, all files, if they are referenced as part of this skill, must first be looked up in that directory; if skill references workspace(current dir) files, search them in current directory. Never search from root or other unrelated directory.", skillPath)
+
 	return ToolResult{
 		Success: true,
-		Output:  content,
+		Output:  output,
 	}, nil
 }
 
-func (t *SkillTool) loadSkill(skillName string) (string, error) {
+func (t *SkillTool) loadSkill(skillName string) (string, string, error) {
 	searchDirs := t.getSearchDirs()
 
 	for _, dir := range searchDirs {
 		skillPath := filepath.Join(dir, skillName, "SKILL.md")
 		data, err := os.ReadFile(skillPath)
 		if err == nil {
-			return string(data), nil
+			return string(data), skillPath, nil
 		}
 	}
 
-	return "", fmt.Errorf("skill '%s' not found in any of: %v", skillName, searchDirs)
+	return "", "", fmt.Errorf("skill '%s' not found in any of: %v", skillName, searchDirs)
 }
 
 func (t *SkillTool) getSearchDirs() []string {
-	var dirs []string
-
-	// 1. skills/ (project-local shorthand)
-	if t.workingDir != "" {
-		dirs = append(dirs, filepath.Join(t.workingDir, "skills"))
+	// Check for MYAGENT_CONFIG_DIR - if set, use only that directory
+	if customDir := os.Getenv("MYAGENT_CONFIG_DIR"); customDir != "" {
+		return []string{filepath.Join(customDir, "skills")}
 	}
 
-	// 2. .claude/skills (project)
+	var dirs []string
+
+	// 1. .claude/skills (project)
 	if t.workingDir != "" {
 		dirs = append(dirs, filepath.Join(t.workingDir, ".claude", "skills"))
 	}
 
-	// 3. ~/.claude/skills (global)
+	// 2. ~/.claude/skills (global)
 	homeDir, _ := os.UserHomeDir()
 	dirs = append(dirs, filepath.Join(homeDir, ".claude", "skills"))
 
 	return dirs
+}
+
+// SkillMetadata represents the YAML frontmatter structure
+type SkillMetadata struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
 }
 
 func (t *SkillTool) parseSkillMetadata(content string) (name, description string) {
@@ -120,6 +130,7 @@ func (t *SkillTool) parseSkillMetadata(content string) (name, description string
 		return
 	}
 
+	// Find the end of frontmatter
 	lines := strings.Split(content, "\n")
 	endIdx := -1
 	for i := 1; i < len(lines); i++ {
@@ -135,15 +146,20 @@ func (t *SkillTool) parseSkillMetadata(content string) (name, description string
 
 	frontmatter := strings.Join(lines[1:endIdx], "\n")
 
-	for _, line := range strings.Split(frontmatter, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "name:") {
-			name = strings.TrimSpace(strings.TrimPrefix(line, "name:"))
+	var metadata SkillMetadata
+	if err := yaml.Unmarshal([]byte(frontmatter), &metadata); err != nil {
+		// Fallback: try simple parsing if YAML parsing fails
+		for _, line := range strings.Split(frontmatter, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "name:") {
+				name = strings.TrimSpace(strings.TrimPrefix(line, "name:"))
+			}
+			if strings.HasPrefix(line, "description:") {
+				description = strings.TrimSpace(strings.TrimPrefix(line, "description:"))
+			}
 		}
-		if strings.HasPrefix(line, "description:") {
-			description = strings.TrimSpace(strings.TrimPrefix(line, "description:"))
-		}
+		return
 	}
 
-	return
+	return metadata.Name, metadata.Description
 }

@@ -29,6 +29,21 @@ import (
 	"agent-system/internal/usage"
 )
 
+// getSessionsDir returns the directory for storing session files.
+// Uses MYAGENT_SESSIONS_DIRECTORY env var if set, otherwise defaults to ~/.claude/myclaude/sessions
+func getSessionsDir() string {
+	customDir := os.Getenv("MYAGENT_SESSIONS_DIRECTORY")
+	prompts.VerboseLog("MYAGENT_SESSIONS_DIRECTORY env var: %q", customDir)
+	if customDir != "" {
+		prompts.VerboseLog("Using custom sessions directory: %s", customDir)
+		return customDir
+	}
+	home, _ := os.UserHomeDir()
+	defaultDir := filepath.Join(home, ".claude", "myclaude", "sessions")
+	prompts.VerboseLog("Using default sessions directory: %s", defaultDir)
+	return defaultDir
+}
+
 // Agent represents the main agent with tools and LLM
 type Agent struct {
 	config        *config.AgentConfig
@@ -45,6 +60,9 @@ type Agent struct {
 	rawOutput     bool
 	noSession     bool
 	readLimit     int
+	debugPrompt   bool
+	outputFile    string
+	finalResponse string
 }
 
 // AgentOptions represents options for creating an agent
@@ -60,6 +78,9 @@ type AgentOptions struct {
 	NoSession    bool
 	EnabledTools []string
 	ReadLimit    int
+	AgentContent string // Content from -a agent file
+	DebugPrompt  bool   // Dump system prompt and exit
+	OutputFile   string // Write final response to file
 }
 
 // NewAgent creates a new agent with the specified options
@@ -85,8 +106,9 @@ func NewAgent(options AgentOptions) (*Agent, error) {
 	// Determine which tools are enabled based on CLI and config
 	enabledToolsList := computeEnabledTools(options.EnabledTools, cfg)
 
-	// Create prompt builder with enabled tools
+	// Create prompt builder with enabled tools and agent content
 	promptBuilder := prompts.NewSystemPromptBuilder(options.WorkingDir, options.IsGitRepo, enabledToolsList)
+	promptBuilder.SetAgentContent(options.AgentContent)
 
 	// Create tool registry
 	toolRegistry := tools.NewToolRegistry()
@@ -107,6 +129,8 @@ func NewAgent(options AgentOptions) (*Agent, error) {
 		rawOutput:     options.RawOutput,
 		noSession:     options.NoSession,
 		readLimit:     options.ReadLimit,
+		debugPrompt:   options.DebugPrompt,
+		outputFile:    options.OutputFile,
 	}
 
 	if agent.sessionID == "" {
@@ -246,8 +270,7 @@ func (a *Agent) logEndTurn() {
 }
 
 func (a *Agent) getSessionPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "myclaude", "sessions", a.sessionID+".json")
+	return filepath.Join(getSessionsDir(), a.sessionID+".json")
 }
 
 func (a *Agent) saveSession() error {
@@ -274,6 +297,9 @@ func (a *Agent) loadSession() error {
 		return err
 	}
 
+	// Log to stderr even in JSON mode
+	fmt.Fprintf(os.Stderr, "restoring session from %s\n", path)
+
 	return json.Unmarshal(data, &a.conversation)
 }
 
@@ -282,11 +308,8 @@ func (a *Agent) GetSessionID() string {
 }
 
 func findLastSession() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	sessionsDir := filepath.Join(home, ".claude", "myclaude", "sessions")
+	sessionsDir := getSessionsDir()
+	prompts.VerboseLog("findLastSession: searching in directory: %s", sessionsDir)
 	entries, err := os.ReadDir(sessionsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -318,9 +341,11 @@ func findLastSession() (string, error) {
 	}
 
 	if lastSession == "" {
+		prompts.VerboseLog("findLastSession: no valid sessions found in %s", sessionsDir)
 		return "", fmt.Errorf("no valid sessions found")
 	}
 
+	prompts.VerboseLog("findLastSession: found last session: %s", lastSession)
 	return lastSession, nil
 }
 
@@ -463,6 +488,15 @@ func (a *Agent) registerTools(registry *tools.ToolRegistry, cfg *config.AgentCon
 
 	// Task tool
 	if isToolEnabled("task", cfg.Tools.Task.Enabled) {
+		// Create callbacks for dynamic agent loading
+		getAgentNames := func() []string {
+			return a.promptBuilder.GetAvailableAgentNames(workingDir)
+		}
+
+		loadAgentContent := func(agentName string) (string, error) {
+			return a.loadAgentContent(agentName, workingDir)
+		}
+
 		taskTool := tools.NewTaskTool(
 			cfg.Tools.Task.DefaultModel,
 			cfg.Tools.Task.AllowedAgents,
@@ -484,28 +518,61 @@ func (a *Agent) registerTools(registry *tools.ToolRegistry, cfg *config.AgentCon
 				a.registerTools(subRegistry, a.config, workingDir, false, enabledTools)
 
 				subOpts := subagent.SubAgentOptions{
-					ParentID:   config.ParentID,
-					AgentType:  config.SubagentType,
-					LLM:        subLLM,
-					Tools:      subRegistry.GetAll(),
-					MaxTurns:   50,
-					JSONOutput: a.jsonOutput,
-					SoftTools:  a.modelConfig.SoftTools,
+					ParentID:            config.ParentID,
+					AgentType:           config.SubagentType,
+					LLM:                 subLLM,
+					Tools:               subRegistry.GetAll(),
+					MaxTurns:            50,
+					JSONOutput:          a.jsonOutput,
+					SoftTools:           a.modelConfig.SoftTools,
+					AgentContent:        config.AgentContent,
+					InitialConversation: config.InitialConversation,
+					ForkedPrompt:        config.ForkedPrompt,
+					Fork:                config.Fork,
 				}
-
-				// If fork is enabled, pass the parent's conversation
-				if config.Fork && len(config.Conversation) > 0 {
-					var conversation []llms.MessageContent
-					if err := json.Unmarshal(config.Conversation, &conversation); err == nil {
-						subOpts.Conversation = conversation
-					}
-				}
-
 				return subagent.NewSubAgent(subOpts), nil
+			},
+			workingDir,
+			getAgentNames,
+			loadAgentContent,
+			func() []llms.MessageContent {
+				return a.conversation
 			},
 		)
 		registry.Register(taskTool)
 	}
+}
+
+// loadAgentContent loads agent content from .claude/agents/ directories
+func (a *Agent) loadAgentContent(agentName string, workingDir string) (string, error) {
+	// Check for MYAGENT_CONFIG_DIR - if set, use only that directory
+	if customDir := os.Getenv("MYAGENT_CONFIG_DIR"); customDir != "" {
+		agentPath := filepath.Join(customDir, "agents", agentName+".md")
+		data, err := os.ReadFile(agentPath)
+		if err == nil {
+			return string(data), nil
+		}
+		return "", fmt.Errorf("agent '%s' not found in %s", agentName, agentPath)
+	}
+
+	// Try project agents first
+	if workingDir != "" {
+		agentPath := filepath.Join(workingDir, ".claude", "agents", agentName+".md")
+		data, err := os.ReadFile(agentPath)
+		if err == nil {
+			return string(data), nil
+		}
+	}
+
+	// Try global agents
+	homeDir, _ := os.UserHomeDir()
+	agentPath := filepath.Join(homeDir, ".claude", "agents", agentName+".md")
+	data, err := os.ReadFile(agentPath)
+	if err == nil {
+		return string(data), nil
+	}
+
+	return "", fmt.Errorf("agent '%s' not found in any agents directory", agentName)
 }
 
 // createLLM creates a langchaingo LLM from configuration
@@ -579,7 +646,10 @@ func (a *Agent) addMessage(msg llms.MessageContent) {
 			prompts.VerboseLog("Added %s message to conversation (%d chars)", msg.Role, len(textPart.Text))
 		}
 	}
-	a.saveSession()
+	if err := a.saveSession(); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Failed to save session: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // Run starts the agentic loop
@@ -597,6 +667,20 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.addMessage(llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt))
 	}
 
+	// Debug mode: dump system prompt and wait for user input to show user prompt
+	if a.debugPrompt {
+		fmt.Println("\n═══════════════════════════════════════════════════════════════════")
+		fmt.Println("SYSTEM PROMPT DEBUG DUMP")
+		fmt.Println("═══════════════════════════════════════════════════════════════════")
+		for _, msg := range a.conversation {
+			if msg.Role == llms.ChatMessageTypeSystem {
+				fmt.Println(msg.Parts[0])
+			}
+		}
+		fmt.Println("═══════════════════════════════════════════════════════════════════")
+		fmt.Println("Enter your prompt (then debug mode will exit without calling LLM):")
+	}
+
 	// Create reader for user input
 	reader := bufio.NewReader(os.Stdin)
 
@@ -610,6 +694,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 
 		input = strings.TrimSpace(input)
+
+		// Debug mode: dump user prompt and exit
+		if a.debugPrompt {
+			fmt.Println("\n═══════════════════════════════════════════════════════════════════")
+			fmt.Println("USER PROMPT:")
+			fmt.Println("═══════════════════════════════════════════════════════════════════")
+			fmt.Println(input)
+			fmt.Println("═══════════════════════════════════════════════════════════════════")
+			fmt.Println("[DEBUG MODE: Exiting without calling LLM]")
+			return nil
+		}
 
 		// Check for exit commands
 		if input == "exit" || input == "quit" {
@@ -722,7 +817,8 @@ func (a *Agent) runAgenticLoop(ctx context.Context) error {
 
 		// Check for tool calls
 		if len(choice.ToolCalls) == 0 {
-			// No tool calls, we're done
+			// No tool calls, we're done - capture final response
+			a.finalResponse = stripReasoningTags(choice.Content)
 			break
 		}
 
@@ -1002,6 +1098,11 @@ func (a *Agent) RunSingle(ctx context.Context, prompt string) error {
 		a.addMessage(llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt))
 	}
 
+	// Debug mode: dump system prompt and user prompt, then exit
+	if a.debugPrompt {
+		return a.dumpPromptsAndExit(prompt)
+	}
+
 	a.logf("USER", "%s\n", prompt)
 
 	// Add user message
@@ -1013,11 +1114,39 @@ func (a *Agent) RunSingle(ctx context.Context, prompt string) error {
 		return err
 	}
 
+	// Write final response to file if outputFile is specified
+	if a.outputFile != "" && a.finalResponse != "" {
+		if err := os.WriteFile(a.outputFile, []byte(a.finalResponse), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing output file: %v\n", err)
+		} else if !a.jsonOutput && !a.rawOutput {
+			fmt.Printf("\nOutput written to: %s\n", a.outputFile)
+		}
+	}
+
 	if a.jsonOutput {
 		a.logEndTurn()
 	} else if !a.rawOutput {
 		fmt.Printf("\nTo resume this conversation: ./main -m %s -r %s\n", a.modelKey, a.sessionID)
 	}
+	return nil
+}
+
+// dumpPromptsAndExit dumps the system prompt and user prompt, then exits without calling LLM
+func (a *Agent) dumpPromptsAndExit(userPrompt string) error {
+	fmt.Println("\n═══════════════════════════════════════════════════════════════════")
+	fmt.Println("SYSTEM PROMPT DEBUG DUMP")
+	fmt.Println("═══════════════════════════════════════════════════════════════════")
+	for _, msg := range a.conversation {
+		if msg.Role == llms.ChatMessageTypeSystem {
+			fmt.Println(msg.Parts[0])
+		}
+	}
+	fmt.Println("═══════════════════════════════════════════════════════════════════")
+	fmt.Println("USER PROMPT:")
+	fmt.Println("═══════════════════════════════════════════════════════════════════")
+	fmt.Println(userPrompt)
+	fmt.Println("═══════════════════════════════════════════════════════════════════")
+	fmt.Println("[DEBUG MODE: Exiting without calling LLM]")
 	return nil
 }
 

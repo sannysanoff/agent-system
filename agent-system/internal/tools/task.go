@@ -6,17 +6,23 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/tmc/langchaingo/llms"
 )
 
 // TaskTool implements subagent task spawning
 type TaskTool struct {
-	defaultModel  string
-	allowedAgents []string
-	maxConcurrent int
-	agentFactory  AgentFactory
-	activeAgents  map[string]*SubAgent
-	parentID      string
-	mu            sync.RWMutex
+	defaultModel          string
+	allowedAgents         []string
+	maxConcurrent         int
+	agentFactory          AgentFactory
+	activeAgents          map[string]*SubAgent
+	parentID              string
+	workingDir            string
+	getAgentNames         func() []string
+	loadAgentContent      func(agentName string) (string, error)
+	getParentConversation func() []llms.MessageContent // Callback to get parent's conversation for fork mode
+	mu                    sync.RWMutex
 }
 
 // AgentFactory is a function that creates subagents
@@ -38,11 +44,13 @@ type SubAgentResult struct {
 
 // SubAgentConfig represents configuration for creating a subagent
 type SubAgentConfig struct {
-	SubagentType string `json:"subagent_type"`
-	Model        string `json:"model,omitempty"`
-	ParentID     string `json:"parent_id,omitempty"`
-	Fork         bool   `json:"fork,omitempty"`
-	Conversation []byte `json:"conversation,omitempty"` // Serialized conversation when forking
+	SubagentType        string        `json:"subagent_type"`
+	Model               string        `json:"model,omitempty"`
+	ParentID            string        `json:"parent_id,omitempty"`
+	AgentContent        string        `json:"agent_content,omitempty"`
+	Fork                bool          `json:"fork,omitempty"`
+	InitialConversation []interface{} `json:"initial_conversation,omitempty"` // Forked conversation from parent
+	ForkedPrompt        string        `json:"forked_prompt,omitempty"`        // The special prompt for fork mode
 }
 
 // TaskParams represents parameters for task execution
@@ -58,17 +66,21 @@ type TaskParams struct {
 }
 
 // NewTaskTool creates a new task tool
-func NewTaskTool(defaultModel string, allowedAgents []string, maxConcurrent int, parentID string, factory AgentFactory) *TaskTool {
+func NewTaskTool(defaultModel string, allowedAgents []string, maxConcurrent int, parentID string, factory AgentFactory, workingDir string, getAgentNames func() []string, loadAgentContent func(agentName string) (string, error), getParentConversation func() []llms.MessageContent) *TaskTool {
 	if maxConcurrent == 0 {
 		maxConcurrent = 5
 	}
 	return &TaskTool{
-		defaultModel:  defaultModel,
-		allowedAgents: allowedAgents,
-		maxConcurrent: maxConcurrent,
-		agentFactory:  factory,
-		activeAgents:  make(map[string]*SubAgent),
-		parentID:      parentID,
+		defaultModel:          defaultModel,
+		allowedAgents:         allowedAgents,
+		maxConcurrent:         maxConcurrent,
+		agentFactory:          factory,
+		activeAgents:          make(map[string]*SubAgent),
+		parentID:              parentID,
+		workingDir:            workingDir,
+		getAgentNames:         getAgentNames,
+		loadAgentContent:      loadAgentContent,
+		getParentConversation: getParentConversation,
 	}
 }
 
@@ -83,6 +95,30 @@ func (t *TaskTool) Description() string {
 }
 
 func (t *TaskTool) Schema() *ToolSchema {
+	// Build enum from built-in types plus available agents from .claude/agents/
+	builtinTypes := []string{"Bash", "Explore", "general-purpose", "Plan", "code-reviewer", "claude-code-guide"}
+
+	var enumValues []string
+	enumValues = append(enumValues, builtinTypes...)
+
+	// Add dynamically discovered agents
+	if t.getAgentNames != nil {
+		agentNames := t.getAgentNames()
+		for _, name := range agentNames {
+			// Skip duplicates
+			found := false
+			for _, builtin := range builtinTypes {
+				if builtin == name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				enumValues = append(enumValues, name)
+			}
+		}
+	}
+
 	return &ToolSchema{
 		Type: "object",
 		Properties: map[string]Property{
@@ -97,7 +133,7 @@ func (t *TaskTool) Schema() *ToolSchema {
 			"subagent_type": {
 				Type:        "string",
 				Description: "The type of specialized agent to use for this task",
-				Enum:        []string{"Bash", "Explore", "general-purpose", "Plan", "code-reviewer", "claude-code-guide"},
+				Enum:        enumValues,
 			},
 			"model": {
 				Type:        "string",
@@ -111,17 +147,17 @@ func (t *TaskTool) Schema() *ToolSchema {
 				Type:        "boolean",
 				Description: "Set to true to run this agent in the background",
 			},
-		"max_turns": {
-			Type:        "integer",
-			Description: "Maximum number of agentic turns before stopping",
+			"max_turns": {
+				Type:        "integer",
+				Description: "Maximum number of agentic turns before stopping",
+			},
+			"fork": {
+				Type:        "boolean",
+				Description: "If true, subagent inherits the parent's conversation history and continues from there",
+			},
 		},
-		"fork": {
-			Type:        "boolean",
-			Description: "When true, the subagent forks (copies) the parent's conversation history with a new GUID. Use when launching multiple parallel subagents to research different things simultaneously.",
-		},
-	},
-	Required: []string{"description", "prompt", "subagent_type"},
-}
+		Required: []string{"description", "prompt", "subagent_type"},
+	}
 }
 
 func (t *TaskTool) Execute(ctx context.Context, params json.RawMessage) (ToolResult, error) {
@@ -189,13 +225,49 @@ func (t *TaskTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 		return t.resumeAgent(ctx, taskParams.Resume)
 	}
 
-	// Create subagent config
+	// Load agent content if it's a custom agent (not a built-in type)
+	var agentContent string
+	builtinTypes := map[string]bool{
+		"Bash":              true,
+		"Explore":           true,
+		"general-purpose":   true,
+		"Plan":              true,
+		"code-reviewer":     true,
+		"claude-code-guide": true,
+	}
+
+	if !builtinTypes[taskParams.SubagentType] && t.loadAgentContent != nil {
+		content, err := t.loadAgentContent(taskParams.SubagentType)
+		if err == nil {
+			agentContent = content
+		}
+	}
+
+	// Create subagent
 	agentConfig := SubAgentConfig{
 		SubagentType: taskParams.SubagentType,
 		Model:        model,
 		ParentID:     t.parentID,
-		Fork:         taskParams.Fork,
-		// Note: Conversation will be populated by agentFactory if Fork is true
+		AgentContent: agentContent,
+	}
+
+	// Handle fork mode: inherit parent's conversation
+	if taskParams.Fork && t.getParentConversation != nil {
+		parentConv := t.getParentConversation()
+		if len(parentConv) > 0 {
+			// Clone the conversation
+			clonedConv := make([]interface{}, len(parentConv))
+			for i, msg := range parentConv {
+				clonedConv[i] = msg
+			}
+			agentConfig.InitialConversation = clonedConv
+
+			// Build the special forked prompt
+			forkedPrompt := fmt.Sprintf("now you act as subagent %s.\n\n<system prompt of %s>\n%s\n</system prompt>\n\nyour current task:\n\n%s",
+				taskParams.SubagentType, taskParams.SubagentType, agentContent, taskParams.Prompt)
+			agentConfig.ForkedPrompt = forkedPrompt
+			agentConfig.Fork = true
+		}
 	}
 
 	agent, err := t.agentFactory(agentConfig)
@@ -217,7 +289,12 @@ func (t *TaskTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 
-			agent.Execute(ctx, taskParams.Prompt, maxTurns)
+			// Use forked prompt if in fork mode, otherwise use regular prompt
+			bgPrompt := taskParams.Prompt
+			if taskParams.Fork && agentConfig.ForkedPrompt != "" {
+				bgPrompt = agentConfig.ForkedPrompt
+			}
+			agent.Execute(ctx, bgPrompt, maxTurns)
 
 			t.mu.Lock()
 			delete(t.activeAgents, agent.ID())
@@ -240,7 +317,13 @@ func (t *TaskTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
-	result, err := agent.Execute(ctx, taskParams.Prompt, maxTurns)
+	// Use forked prompt if in fork mode, otherwise use regular prompt
+	executePrompt := taskParams.Prompt
+	if taskParams.Fork && agentConfig.ForkedPrompt != "" {
+		executePrompt = agentConfig.ForkedPrompt
+	}
+
+	result, err := agent.Execute(ctx, executePrompt, maxTurns)
 	if err != nil {
 		return ToolResult{
 			Success: false,

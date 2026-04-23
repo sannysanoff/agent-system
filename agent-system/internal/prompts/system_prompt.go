@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // SystemPromptBuilder builds system prompts for the agent
@@ -14,6 +16,7 @@ type SystemPromptBuilder struct {
 	workingDir   string
 	isGitRepo    bool
 	enabledTools []string
+	agentContent string
 }
 
 // NewSystemPromptBuilder creates a new system prompt builder
@@ -26,6 +29,11 @@ func NewSystemPromptBuilder(workingDir string, isGitRepo bool, enabledTools []st
 		isGitRepo:    isGitRepo,
 		enabledTools: enabledTools,
 	}
+}
+
+// SetAgentContent sets the agent content to be injected into the system prompt
+func (b *SystemPromptBuilder) SetAgentContent(content string) {
+	b.agentContent = content
 }
 
 // GetWorkingDir returns the working directory
@@ -53,10 +61,27 @@ func (b *SystemPromptBuilder) BuildSystemPromptWithContext(projectRoot string) s
 		VerboseLog("Added skills list to system prompt")
 	}
 
+	// Build agents list for system-reminder (name + description only)
+	agentsList := b.GetAgentsList(projectRoot)
+	if agentsList != "" {
+		prompt += "<system-reminder>\n"
+		prompt += "The following agents are available for use with the Task tool:\n\n"
+		prompt += agentsList
+		prompt += "</system-reminder>\n\n"
+		VerboseLog("Added agents list to system prompt")
+	}
+
+	// Add agent content if provided (from -a flag)
+	if b.agentContent != "" {
+		prompt += "<agent-persona>\n"
+		prompt += b.agentContent
+		prompt += "\n</agent-persona>\n\n"
+		VerboseLog("Added agent content to system prompt (%d chars)", len(b.agentContent))
+	}
+
 	prompt += b.getSystemRole()
 	prompt += b.getToneAndStyle()
 	prompt += b.getProfessionalGuidelines()
-	prompt += b.getTimeEstimationPolicy()
 	prompt += b.getAskingQuestionsPolicy()
 	prompt += b.getDoingTasksGuidelines()
 	prompt += b.getToolUsagePolicy()
@@ -92,29 +117,28 @@ type SkillInfo struct {
 
 // GetSkillsList returns a list of available skills with names and descriptions
 func (b *SystemPromptBuilder) GetSkillsList(projectRoot string) string {
-	// Priority order (highest to lowest):
-	// 1. skills/ (project-local shorthand)
-	// 2. .claude/skills (project)
-	// 3. ~/.claude/skills (global)
-
 	seenSkills := make(map[string]bool)
 	var skills []SkillInfo
 
-	// 1. Load project-local skills/ directory
-	if projectRoot != "" {
-		localSkills := b.loadSkillsInfoFromDirWithDedup(projectRoot+"/skills", "local", seenSkills)
-		skills = append(skills, localSkills...)
-	}
+	// Check for MYAGENT_CONFIG_DIR - if set, use only that directory and disable all defaults
+	if customDir := os.Getenv("MYAGENT_CONFIG_DIR"); customDir != "" {
+		customSkills := b.loadSkillsInfoFromDirWithDedup(filepath.Join(customDir, "skills"), "custom", seenSkills)
+		skills = append(skills, customSkills...)
+	} else {
+		// Default priority order (highest to lowest):
+		// 1. .claude/skills (project)
+		// 2. ~/.claude/skills (global)
 
-	// 2. Load .claude/skills (project)
-	if projectRoot != "" {
-		projectSkills := b.loadSkillsInfoFromDirWithDedup(b.getProjectSkillsDir(projectRoot), "project", seenSkills)
-		skills = append(skills, projectSkills...)
-	}
+		// 1. Load .claude/skills (project)
+		if projectRoot != "" {
+			projectSkills := b.loadSkillsInfoFromDirWithDedup(b.getProjectSkillsDir(projectRoot), "project", seenSkills)
+			skills = append(skills, projectSkills...)
+		}
 
-	// 3. Load global skills ~/.claude/skills
-	globalSkills := b.loadSkillsInfoFromDirWithDedup(b.getGlobalSkillsDir(), "global", seenSkills)
-	skills = append(skills, globalSkills...)
+		// 2. Load global skills ~/.claude/skills
+		globalSkills := b.loadSkillsInfoFromDirWithDedup(b.getGlobalSkillsDir(), "global", seenSkills)
+		skills = append(skills, globalSkills...)
+	}
 
 	if len(skills) == 0 {
 		return ""
@@ -172,6 +196,12 @@ func (b *SystemPromptBuilder) loadSkillsInfoFromDirWithDedup(skillsDir, skillTyp
 	return skills
 }
 
+// SkillFrontmatter represents the YAML frontmatter structure for skills
+type SkillFrontmatter struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+}
+
 // parseSkillMetadata extracts name and description from YAML frontmatter
 func parseSkillMetadata(content, defaultName string) SkillInfo {
 	info := SkillInfo{Name: defaultName, Description: ""}
@@ -195,28 +225,231 @@ func parseSkillMetadata(content, defaultName string) SkillInfo {
 		return info
 	}
 
-	// Parse frontmatter lines
+	// Parse frontmatter using YAML parser
 	frontmatter := strings.Join(lines[1:endIdx], "\n")
 
-	// Extract name
-	if strings.Contains(frontmatter, "name:") {
+	var metadata SkillFrontmatter
+	if err := yaml.Unmarshal([]byte(frontmatter), &metadata); err != nil {
+		// Fallback: try simple line-by-line parsing
 		for _, line := range strings.Split(frontmatter, "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "name:") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "name:") {
 				info.Name = strings.TrimSpace(strings.TrimPrefix(line, "name:"))
-				break
 			}
+			if strings.HasPrefix(line, "description:") {
+				info.Description = strings.TrimSpace(strings.TrimPrefix(line, "description:"))
+			}
+		}
+		return info
+	}
+
+	if metadata.Name != "" {
+		info.Name = metadata.Name
+	}
+	info.Description = metadata.Description
+
+	return info
+}
+
+// AgentInfo represents agent metadata
+type AgentInfo struct {
+	Name        string
+	Description string
+}
+
+// GetAgentsList returns a list of available agents with names and descriptions
+func (b *SystemPromptBuilder) GetAgentsList(projectRoot string) string {
+	seenAgents := make(map[string]bool)
+	var agents []AgentInfo
+
+	// Check for MYAGENT_CONFIG_DIR - if set, use only that directory and disable all defaults
+	if customDir := os.Getenv("MYAGENT_CONFIG_DIR"); customDir != "" {
+		customAgents := b.loadAgentsInfoFromDirWithDedup(filepath.Join(customDir, "agents"), "custom", seenAgents)
+		agents = append(agents, customAgents...)
+	} else {
+		// Default priority order (highest to lowest):
+		// 1. .claude/agents (project)
+		// 2. ~/.claude/agents (global)
+
+		// 1. Load .claude/agents (project)
+		if projectRoot != "" {
+			projectAgents := b.loadAgentsInfoFromDirWithDedup(b.getProjectAgentsDir(projectRoot), "project", seenAgents)
+			agents = append(agents, projectAgents...)
+		}
+
+		// 2. Load global agents ~/.claude/agents
+		globalAgents := b.loadAgentsInfoFromDirWithDedup(b.getGlobalAgentsDir(), "global", seenAgents)
+		agents = append(agents, globalAgents...)
+	}
+
+	if len(agents) == 0 {
+		return ""
+	}
+
+	var lines []string
+	for _, agent := range agents {
+		lines = append(lines, fmt.Sprintf("- %s: %s", agent.Name, agent.Description))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// GetAvailableAgentNames returns a list of available agent names for task tool enum
+func (b *SystemPromptBuilder) GetAvailableAgentNames(projectRoot string) []string {
+	seenAgents := make(map[string]bool)
+	var names []string
+
+	// Check for MYAGENT_CONFIG_DIR
+	if customDir := os.Getenv("MYAGENT_CONFIG_DIR"); customDir != "" {
+		dir := filepath.Join(customDir, "agents")
+		names = append(names, b.loadAgentNamesFromDir(dir, seenAgents)...)
+	} else {
+		// Project agents
+		if projectRoot != "" {
+			dir := b.getProjectAgentsDir(projectRoot)
+			names = append(names, b.loadAgentNamesFromDir(dir, seenAgents)...)
+		}
+
+		// Global agents
+		dir := b.getGlobalAgentsDir()
+		names = append(names, b.loadAgentNamesFromDir(dir, seenAgents)...)
+	}
+
+	return names
+}
+
+func (b *SystemPromptBuilder) getGlobalAgentsDir() string {
+	homeDir, _ := os.UserHomeDir()
+	return filepath.Join(homeDir, ".claude", "agents")
+}
+
+func (b *SystemPromptBuilder) getProjectAgentsDir(projectRoot string) string {
+	return filepath.Join(projectRoot, ".claude", "agents")
+}
+
+func (b *SystemPromptBuilder) loadAgentsInfoFromDirWithDedup(agentsDir, agentType string, seen map[string]bool) []AgentInfo {
+	var agents []AgentInfo
+
+	entries, err := os.ReadDir(agentsDir)
+	if err != nil {
+		return agents
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".md") {
+			continue
+		}
+
+		agentName := strings.TrimSuffix(name, ".md")
+
+		// Skip if already loaded from higher priority source
+		if seen[agentName] {
+			continue
+		}
+		seen[agentName] = true
+
+		// Look for agent file
+		agentPath := filepath.Join(agentsDir, name)
+		data, err := os.ReadFile(agentPath)
+		if err != nil {
+			continue
+		}
+
+		// Parse YAML frontmatter for name and description
+		info := b.parseAgentMetadata(string(data), agentName)
+		agents = append(agents, info)
+		VerboseLog("Loaded %s agent info: %s - %s", agentType, info.Name, info.Description)
+	}
+
+	return agents
+}
+
+func (b *SystemPromptBuilder) loadAgentNamesFromDir(agentsDir string, seen map[string]bool) []string {
+	var names []string
+
+	entries, err := os.ReadDir(agentsDir)
+	if err != nil {
+		return names
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".md") {
+			continue
+		}
+
+		agentName := strings.TrimSuffix(name, ".md")
+
+		// Skip if already seen
+		if seen[agentName] {
+			continue
+		}
+		seen[agentName] = true
+		names = append(names, agentName)
+	}
+
+	return names
+}
+
+// parseAgentMetadata extracts name and description from YAML frontmatter
+func (b *SystemPromptBuilder) parseAgentMetadata(content, defaultName string) AgentInfo {
+	info := AgentInfo{Name: defaultName, Description: ""}
+
+	// Check for YAML frontmatter
+	if !strings.HasPrefix(content, "---") {
+		return info
+	}
+
+	// Find the closing ---
+	lines := strings.Split(content, "\n")
+	endIdx := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			endIdx = i
+			break
 		}
 	}
 
-	// Extract description
-	if strings.Contains(frontmatter, "description:") {
+	if endIdx < 0 {
+		return info
+	}
+
+	// Parse frontmatter using YAML parser
+	frontmatter := strings.Join(lines[1:endIdx], "\n")
+
+	type AgentFrontmatter struct {
+		Name        string `yaml:"name"`
+		Description string `yaml:"description"`
+	}
+
+	var metadata AgentFrontmatter
+	if err := yaml.Unmarshal([]byte(frontmatter), &metadata); err != nil {
+		// Fallback: try simple line-by-line parsing
 		for _, line := range strings.Split(frontmatter, "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "description:") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "name:") {
+				info.Name = strings.TrimSpace(strings.TrimPrefix(line, "name:"))
+			}
+			if strings.HasPrefix(line, "description:") {
 				info.Description = strings.TrimSpace(strings.TrimPrefix(line, "description:"))
-				break
 			}
 		}
+		return info
 	}
+
+	if metadata.Name != "" {
+		info.Name = metadata.Name
+	}
+	info.Description = metadata.Description
 
 	return info
 }
@@ -224,21 +457,6 @@ func parseSkillMetadata(content, defaultName string) SkillInfo {
 func (b *SystemPromptBuilder) getSystemRole() string {
 	return `You are Agent-System, an interactive CLI agent that helps users with software engineering tasks.
 Use the instructions below and the tools available to you to assist the user.
-
-IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges,
-and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass
-targeting, supply chain compromise, or detection evasion for malicious purposes.
-Dual-use security tools (C2 frameworks, credential testing, exploit development) require
-clear authorization context: pentesting engagements, CTF competitions, security research, or
-defensive use cases.
-
-IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident
-that the URLs are for helping the user with programming. You may use URLs provided
-by the user in their messages or local files.
-
-If user asks for help or wants to give feedback inform them of the following:
-- /help: Get help with using the agent system
-- To give feedback, users should report issues at the project repository
 
 `
 }
@@ -254,9 +472,6 @@ func (b *SystemPromptBuilder) getToneAndStyle() string {
   like Bash or code comments as a means to communicate with the user during the session.
 - NEVER create files unless they're absolutely necessary for achieving your goal. ALWAYS prefer
   editing an existing file to creating a new one. This includes markdown files.
-- Do not use a colon before tool calls. Your tool calls may not be shown directly
-  in the output, so text like "Let me read the file:" followed by a read tool call
-  should just be "Let me read the file." with a period.
 
 `
 }
@@ -276,29 +491,11 @@ praise when responding to users such as "You're absolutely right" or similar phr
 `
 }
 
-func (b *SystemPromptBuilder) getTimeEstimationPolicy() string {
-	return `# No time estimates
-Never give time estimates or predictions about how long tasks will take, whether for
-your own work or for users planning their projects. Avoid phrases like "this will
-take me a few minutes," "should be done in about 5 minutes," "this is a
-quick fix," "this will take 2-3 weeks," or "we can do this later."
-Focus on what needs to be done, not how long it might take. Break work into
-actionable steps and let users judge timing for themselves.
-
-`
-}
-
 func (b *SystemPromptBuilder) getAskingQuestionsPolicy() string {
 	return `# Asking questions as you work
-You have access to AskUserQuestion tool to ask the user questions when you need
+Use the method of asking user when you need to ask the user questions for
 clarification, want to validate assumptions, or need to make a decision you're
-unsure about. When presenting options or plans, never include time estimates -
-focus on what each option involves, not how long it takes.
-
-Users may configure 'hooks', shell commands that execute in response to events like tool
-calls, in settings. Treat feedback from hooks as coming from the user. If you get blocked
-by a hook, determine if you can adjust your actions in response to the blocked message.
-If not, ask the user to check their hooks configuration.
+unsure about.
 
 `
 }
@@ -312,7 +509,6 @@ For these tasks the following steps are recommended:
 - NEVER propose changes to code you haven't read. If a user asks about or wants
   you to modify a file, read it first. Understand existing code before suggesting
   modifications.
-- Use AskUserQuestion tool to ask questions, clarify and gather information as needed.
 - Be careful not to introduce security vulnerabilities such as command injection, XSS, SQL
   injection, and other OWASP top 10 vulnerabilities. If you notice that you wrote
   insecure code, immediately fix it.

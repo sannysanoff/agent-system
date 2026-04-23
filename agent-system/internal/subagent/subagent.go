@@ -18,6 +18,16 @@ import (
 	"agent-system/internal/usage"
 )
 
+// getSessionsDir returns the directory for storing session files.
+// Uses MYAGENT_SESSIONS_DIRECTORY env var if set, otherwise defaults to ~/.claude/myclaude/sessions
+func getSessionsDir() string {
+	if customDir := os.Getenv("MYAGENT_SESSIONS_DIRECTORY"); customDir != "" {
+		return customDir
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude", "myclaude", "sessions")
+}
+
 // SubAgent implements a subagent that can execute tasks autonomously
 type SubAgent struct {
 	id           string
@@ -31,19 +41,24 @@ type SubAgent struct {
 	turnsUsed    int
 	jsonOutput   bool
 	softTools    bool
+	agentContent string
+	fork         bool // Whether this is a forked subagent
 }
 
 // SubAgentOptions represents options for creating a subagent
 type SubAgentOptions struct {
-	ID           string
-	ParentID     string
-	AgentType    string
-	LLM          llms.Model
-	Tools        []tools.Tool
-	MaxTurns     int
-	JSONOutput   bool
-	SoftTools    bool
-	Conversation []llms.MessageContent // Forked conversation from parent (when fork=true)
+	ID                  string
+	ParentID            string
+	AgentType           string
+	LLM                 llms.Model
+	Tools               []tools.Tool
+	MaxTurns            int
+	JSONOutput          bool
+	SoftTools           bool
+	AgentContent        string
+	InitialConversation []interface{} // Forked conversation from parent (optional)
+	ForkedPrompt        string        // Special prompt for fork mode (optional)
+	Fork                bool          // Whether this is a forked subagent
 }
 
 // NewSubAgent creates a new subagent
@@ -58,12 +73,16 @@ func NewSubAgent(options SubAgentOptions) *SubAgent {
 		id = uuid.New().String()
 	}
 
-	// Initialize conversation - use forked conversation if provided, otherwise empty
-	conversation := make([]llms.MessageContent, 0)
-	if len(options.Conversation) > 0 {
-		// Fork the parent's conversation (creates a copy)
-		conversation = make([]llms.MessageContent, len(options.Conversation))
-		copy(conversation, options.Conversation)
+	// Initialize conversation - either fork from parent or start fresh
+	var initialConv []llms.MessageContent
+	if options.Fork && len(options.InitialConversation) > 0 {
+		// Clone the parent's conversation
+		initialConv = make([]llms.MessageContent, len(options.InitialConversation))
+		for i, msg := range options.InitialConversation {
+			if lm, ok := msg.(llms.MessageContent); ok {
+				initialConv[i] = lm
+			}
+		}
 	}
 
 	return &SubAgent{
@@ -73,10 +92,12 @@ func NewSubAgent(options SubAgentOptions) *SubAgent {
 		agentType:    options.AgentType,
 		llm:          options.LLM,
 		toolRegistry: registry,
-		conversation: conversation,
+		conversation: initialConv,
 		maxTurns:     options.MaxTurns,
 		jsonOutput:   options.JSONOutput,
 		softTools:    options.SoftTools,
+		agentContent: options.AgentContent,
+		fork:         options.Fork,
 	}
 }
 
@@ -130,8 +151,7 @@ func (s *SubAgent) logfWithMeta(role string, u *usage.Usage, meta map[string]int
 }
 
 func (s *SubAgent) getSessionPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "myclaude", "sessions", s.sessionID+".json")
+	return filepath.Join(getSessionsDir(), s.sessionID+".json")
 }
 
 func (s *SubAgent) saveSession() error {
@@ -150,7 +170,10 @@ func (s *SubAgent) saveSession() error {
 
 func (s *SubAgent) addMessage(msg llms.MessageContent) {
 	s.conversation = append(s.conversation, msg)
-	s.saveSession()
+	if err := s.saveSession(); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Failed to save session: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // ID returns the subagent ID
@@ -164,17 +187,20 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 		s.maxTurns = maxTurns
 	}
 
-	// Build system prompt based on agent type
-	systemPrompt := s.buildSystemPrompt()
+	// Build system prompt based on agent type (only if not forking)
+	systemPrompt := ""
+	if !s.fork {
+		systemPrompt = s.buildSystemPrompt()
+	}
 
 	// Initialize conversation
 	if len(s.conversation) == 0 {
-		// Fresh conversation - add system prompt and user prompt
+		// Normal mode: start fresh with system prompt
 		s.addMessage(llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt))
 		s.addMessage(llms.TextParts(llms.ChatMessageTypeHuman, prompt))
-	} else {
-		// Forked conversation - conversation already has parent's history
-		// Append the new user prompt to continue from where parent left off
+	} else if s.fork {
+		// Fork mode: conversation is already cloned from parent
+		// Just append the forked prompt as a new user message
 		s.addMessage(llms.TextParts(llms.ChatMessageTypeHuman, prompt))
 	}
 
@@ -294,6 +320,18 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 
 // buildSystemPrompt builds the system prompt based on agent type
 func (s *SubAgent) buildSystemPrompt() string {
+	// If custom agent content is provided, use it
+	if s.agentContent != "" {
+		return `You are a specialized subagent for complex tasks.
+You have access to tools and should use them to complete the assigned task.
+Return a clear, concise final response when complete.
+
+<agent-persona>
+` + s.agentContent + `
+</agent-persona>
+`
+	}
+
 	basePrompt := `You are a specialized subagent for complex tasks.
 You have access to tools and should use them to complete the assigned task.
 Return a clear, concise final response when complete.
