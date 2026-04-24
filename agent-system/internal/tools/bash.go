@@ -8,7 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
+)
+
+const (
+	defaultBashTimeout = 180 * time.Second
+	maxBashTimeout     = 900 * time.Second
 )
 
 // BashTool implements bash command execution
@@ -30,14 +36,22 @@ type BashParams struct {
 }
 
 // NewBashTool creates a new bash tool
-func NewBashTool(workingDir string, defaultTimeoutMs int, allowedCommands, blockedCommands []string) *BashTool {
+func NewBashTool(workingDir string, defaultTimeoutSecs int, allowedCommands, blockedCommands []string) *BashTool {
 	if workingDir == "" {
 		workingDir, _ = os.Getwd()
 	}
 
+	defaultTimeout := time.Duration(defaultTimeoutSecs) * time.Second
+	if defaultTimeout <= 0 {
+		defaultTimeout = defaultBashTimeout
+	}
+	if defaultTimeout > maxBashTimeout {
+		defaultTimeout = maxBashTimeout
+	}
+
 	return &BashTool{
 		workingDir:      workingDir,
-		defaultTimeout:  time.Duration(defaultTimeoutMs) * time.Millisecond,
+		defaultTimeout:  defaultTimeout,
 		allowedCommands: allowedCommands,
 		blockedCommands: blockedCommands,
 	}
@@ -62,7 +76,7 @@ func (t *BashTool) Schema() *ToolSchema {
 			},
 			"timeout": {
 				Type:        "integer",
-				Description: "Optional timeout in milliseconds (max 7200000)",
+				Description: "Optional timeout in seconds. Defaults to 180 and is capped at 900.",
 			},
 			"description": {
 				Type:        "string",
@@ -139,16 +153,8 @@ func (t *BashTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 		workdir = bashParams.Workdir
 	}
 
-	// Determine timeout
-	timeout := t.defaultTimeout
-	if bashParams.Timeout != nil && *bashParams.Timeout > 0 {
-		timeout = time.Duration(*bashParams.Timeout) * time.Millisecond
-		if timeout > 2*time.Hour {
-			timeout = 2 * time.Hour
-		}
-	}
+	timeout := t.resolveTimeout(bashParams.Timeout)
 
-	// Create command context with timeout
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -158,18 +164,17 @@ func (t *BashTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 		shell = "/bin/bash"
 	}
 
-	// Create command
-	cmd := exec.CommandContext(cmdCtx, shell, "-c", bashParams.Command)
+	cmd := exec.Command(shell, "-c", bashParams.Command)
 	cmd.Dir = workdir
 	cmd.Env = os.Environ()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// Capture output
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	// Run command
-	err := cmd.Run()
+	err := runCommandWithContext(cmdCtx, cmd)
 
 	output := stdout.String()
 	stderrStr := stderr.String()
@@ -221,4 +226,52 @@ func (t *BashTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 	}
 
 	return result, nil
+}
+
+func (t *BashTool) resolveTimeout(requested *int) time.Duration {
+	timeout := t.defaultTimeout
+	if timeout <= 0 {
+		timeout = defaultBashTimeout
+	}
+	if requested != nil && *requested > 0 {
+		timeout = time.Duration(*requested) * time.Second
+	}
+	if timeout > maxBashTimeout {
+		return maxBashTimeout
+	}
+	return timeout
+}
+
+func runCommandWithContext(ctx context.Context, cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		killProcessGroup(cmd)
+		<-done
+		return ctx.Err()
+	}
+}
+
+func killProcessGroup(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err == nil {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		return
+	}
+
+	_ = cmd.Process.Kill()
 }

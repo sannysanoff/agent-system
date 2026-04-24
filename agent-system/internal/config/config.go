@@ -44,7 +44,7 @@ type AgentConfig struct {
 type ToolConfig struct {
 	Bash struct {
 		Enabled          bool     `yaml:"enabled"`
-		DefaultTimeout   int      `yaml:"default_timeout_ms"`
+		DefaultTimeout   int      `yaml:"default_timeout_secs"`
 		AllowedCommands  []string `yaml:"allowed_commands,omitempty"`
 		BlockedCommands  []string `yaml:"blocked_commands,omitempty"`
 		WorkingDirectory string   `yaml:"working_directory,omitempty"`
@@ -172,7 +172,7 @@ func LoadConfig(path string) (*AgentConfig, error) {
 
 	// Apply defaults
 	if config.Tools.Bash.DefaultTimeout == 0 {
-		config.Tools.Bash.DefaultTimeout = 120000 // 2 minutes
+		config.Tools.Bash.DefaultTimeout = 180 // 3 minutes
 	}
 	if config.Tools.Grep.MaxResults == 0 {
 		config.Tools.Grep.MaxResults = 1000

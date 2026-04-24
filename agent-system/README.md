@@ -65,7 +65,7 @@ Configures tool availability and behavior:
 tools:
   bash:
     enabled: true
-    default_timeout_ms: 120000
+    default_timeout_secs: 180
     allowed_commands: ["git", "ls"]  # optional whitelist
     blocked_commands: ["rm", "dd"]   # optional blacklist
 

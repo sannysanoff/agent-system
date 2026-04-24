@@ -78,7 +78,7 @@ These tools are always available and their complete descriptions are part of the
 
 **Parameters:**
   - `command`: string (required) - The command to execute
-  - `timeout`: number (optional) - Optional timeout in milliseconds (max 7200000)
+  - `timeout`: number (optional) - Optional timeout in seconds. Defaults to 180 and is capped at 900.
   - `description`: string (optional) - Clear, concise description of what this command does in active voice
   - `run_in_background`: boolean (optional) - Set to true to run this command in the background. Use TaskOutput to read the output later.
   - `dangerouslyDisableSandbox`: boolean (optional) - Set this to true to dangerously override sandbox mode and run commands without sandboxing.
