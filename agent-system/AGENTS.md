@@ -2,6 +2,63 @@
 
 This document catalogs reference projects and implementations relevant to building agent systems.
 
+## This Project: Agent System
+
+A general-purpose agent system built with Go and langchaingo, featuring an agentic loop with parallel tool execution, subagents, and configurable prompts.
+
+### Project Structure
+
+| Directory | Purpose |
+|-----------|---------|
+| `cmd/agent/` | Main entry point (main.go) |
+| `internal/agent/` | Main agent loop implementation |
+| `internal/tools/` | Tool implementations (Bash, Read, Write, Edit, Glob, Grep, Task, Ask, WebFetch, WebSearch) |
+| `internal/subagent/` | Subagent execution framework |
+| `internal/config/` | YAML-based configuration system |
+| `internal/prompts/` | System prompt builder |
+| `internal/usage/` | LLM usage tracking |
+| `pkg/llm/` | LLM provider integrations |
+
+### Key Concepts
+
+#### Tool Interface
+All tools implement the `Tool` interface:
+- `Name()` - Unique tool identifier
+- `Description()` - Tool purpose for LLM
+- `Schema()` - JSON schema for parameters
+- `Execute()` - Tool execution logic
+
+#### Tool Registry
+Central registry (`ToolRegistry`) manages tool registration and execution:
+- Thread-safe tool storage
+- Parallel execution with semaphore-based limiting (default: 10 concurrent)
+- Converts tools to langchaingo format
+
+#### Agent Loop
+The main agentic loop (`internal/agent/agent.go`):
+1. Receives user input
+2. Calls LLM with available tools
+3. Executes tool calls in parallel
+4. Returns results to LLM
+5. Continues until final response or max turns reached
+
+#### Subagent System
+Task tool spawns specialized subagents:
+- **Fork Mode**: Subagent inherits parent's conversation history (`fork=true`)
+- **Agent Types**: Bash, Explore, Plan, general-purpose, code-reviewer, claude-code-guide
+- **Session Persistence**: Conversations saved to `~/.claude/myclaude/sessions/`
+
+#### Configuration
+YAML-based configuration (`config.yaml`):
+- **Variables Section**: Key-value pairs with `${VAR}` interpolation
+- **Models Section**: LLM provider settings (OpenAI, Anthropic, Bedrock, Ollama)
+- **Tools Section**: Tool enablement and settings
+
+#### Session Management
+- Sessions stored as JSON files
+- Resume with `-r <session_id>`
+- Environment variable `MYAGENT_SESSIONS_DIRECTORY` overrides default path
+
 ## LangChain Go (langchaingo)
 
 **Location**: `../ref/langchaingo/`

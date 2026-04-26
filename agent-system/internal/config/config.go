@@ -30,6 +30,8 @@ type ModelConfig struct {
 	SoftTools    bool              `yaml:"soft_tools,omitempty"`    // Enable soft tools mode
 	CachePoints  bool              `yaml:"cache_points,omitempty"`  // Enable cache points for Nova models
 	Format       string            `yaml:"format,omitempty"`        // Request format: "openai" or "nova" (default: openai)
+	ForceReasoningContent bool  `yaml:force_reasoning_content,omitempty` // Always pass reasoning_content field to API
+	TimeoutSecs  int               `yaml:"timeout_secs,omitempty"`  // HTTP timeout for API calls (default: 180s)
 }
 
 // AgentConfig represents the main configuration structure

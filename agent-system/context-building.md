@@ -80,7 +80,6 @@ These tools are always available and their complete descriptions are part of the
   - `command`: string (required) - The command to execute
   - `timeout`: number (optional) - Optional timeout in seconds. Defaults to 180 and is capped at 900.
   - `description`: string (optional) - Clear, concise description of what this command does in active voice
-  - `run_in_background`: boolean (optional) - Set to true to run this command in the background. Use TaskOutput to read the output later.
   - `dangerouslyDisableSandbox`: boolean (optional) - Set this to true to dangerously override sandbox mode and run commands without sandboxing.
   - `_simulatedSedEdit`: object (optional) - Internal: pre-computed sed edit result from preview
 
@@ -150,9 +149,8 @@ These tools are always available and their complete descriptions are part of the
   - `prompt`: string (required) - The task for the agent to perform
   - `subagent_type`: string (required) - The type of specialized agent to use for this task
   - `model`: string [sonnet, opus, haiku] (optional) - Optional model to use for this agent
-  - `resume`: string (optional) - Optional agent ID to resume from
-  - `run_in_background`: boolean (optional) - Set to true to run this agent in the background
   - `max_turns`: integer (optional) - Maximum number of agentic turns before stopping
+  - `fork`: boolean (optional) - If true, subagent inherits the parent's conversation history and continues from there
 
 #### AskUserQuestion Tool
 **Description:** Use this tool when you need to ask the user questions during execution. This allows you to: 1) Gather user preferences or requirements, 2) Clarify ambiguous instructions, 3) Get decisions on implementation choices as you work, 4) Offer choices to the user about what direction to take.

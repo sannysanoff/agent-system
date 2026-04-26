@@ -3,11 +3,14 @@ package bedrock_invoke
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/aws/smithy-go"
 
 	"agent-system/internal/config"
 	"agent-system/internal/prompts"
@@ -341,11 +344,53 @@ func (m *BedrockInvokeModel) GenerateContent(ctx context.Context, messages []llm
 		}
 	}
 
-	result, err := m.client.InvokeModel(ctx, input)
-	callDuration := time.Since(callStartTime)
-	if err != nil {
-		return nil, fmt.Errorf("failed to invoke model: %w", err)
+	// Retry configuration for transient errors
+	const maxRetries = 3
+	const baseDelay = 500 * time.Millisecond
+
+	var result *bedrockruntime.InvokeModelOutput
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := baseDelay * time.Duration(1<<uint(attempt-1)) // exponential backoff
+			fmt.Fprintf(os.Stderr, "Retrying InvokeModel after %v (attempt %d/%d, request size: %d bytes)\n", delay, attempt+1, maxRetries, len(reqBody))
+			time.Sleep(delay)
+		}
+
+		result, lastErr = m.client.InvokeModel(ctx, input)
+		if lastErr == nil {
+			break
+		}
+
+		// Check if error is a 5xx server error (retryable)
+		var apiErr smithy.APIError
+		if errors.As(lastErr, &apiErr) {
+			statusCode := 0
+			if httpErr, ok := lastErr.(interface{ HTTPStatusCode() int }); ok {
+				statusCode = httpErr.HTTPStatusCode()
+			}
+
+			// Log detailed error info with context
+			if statusCode >= 500 {
+				fmt.Fprintf(os.Stderr, "InvokeModel failed with status %d (attempt %d/%d): %v\n", statusCode, attempt+1, maxRetries, lastErr)
+				fmt.Fprintf(os.Stderr, "Request context: model=%s, region=%s, request_size=%d bytes\n", m.modelConfig.ModelID, m.modelConfig.Region, len(reqBody))
+				continue // retry
+			}
+
+			// Non-5xx errors are not retryable
+			return nil, fmt.Errorf("API returned unexpected status code: %d (request_size=%d bytes): %w", statusCode, len(reqBody), lastErr)
+		}
+
+		// Non-API errors (network, etc.) - retry
+		fmt.Fprintf(os.Stderr, "InvokeModel failed (attempt %d/%d): %v\n", attempt+1, maxRetries, lastErr)
 	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to invoke model after %d attempts (request_size=%d bytes): %w", maxRetries, len(reqBody), lastErr)
+	}
+
+	callDuration := time.Since(callStartTime)
 
 	var content string
 	var inputTokens, outputTokens int

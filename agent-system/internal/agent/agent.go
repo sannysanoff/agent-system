@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,23 +47,25 @@ func getSessionsDir() string {
 
 // Agent represents the main agent with tools and LLM
 type Agent struct {
-	config        *config.AgentConfig
-	modelConfig   config.ModelConfig
-	modelKey      string
-	llm           llms.Model
-	toolRegistry  *tools.ToolRegistry
-	promptBuilder *prompts.SystemPromptBuilder
-	conversation  []llms.MessageContent
-	maxTurns      int
-	currentTurn   int
-	sessionID     string
-	jsonOutput    bool
-	rawOutput     bool
-	noSession     bool
-	readLimit     int
-	debugPrompt   bool
-	outputFile    string
-	finalResponse string
+	config           *config.AgentConfig
+	modelConfig      config.ModelConfig
+	modelKey         string
+	llm              llms.Model
+	toolRegistry     *tools.ToolRegistry
+	promptBuilder    *prompts.SystemPromptBuilder
+	conversation     []llms.MessageContent
+	maxTurns         int
+	currentTurn      int
+	sessionID        string
+	jsonOutput       bool
+	rawOutput        bool
+	noSession        bool
+	readLimit        int
+	debugPrompt      bool
+	outputFile       string
+	finalResponse    string
+	launchMode       string // Track launch mode: "new", "last", or "restore"
+	historyLoaded    bool   // Track if history was successfully loaded
 }
 
 // AgentOptions represents options for creating an agent
@@ -135,21 +138,29 @@ func NewAgent(options AgentOptions) (*Agent, error) {
 
 	if agent.sessionID == "" {
 		agent.sessionID = uuid.New().String()
+		agent.launchMode = "new"
+		agent.historyLoaded = false
 	} else if agent.sessionID == "last" {
 		lastID, err := findLastSession()
 		if err != nil {
 			// No sessions found, silently start a new session
 			agent.sessionID = uuid.New().String()
+			agent.launchMode = "new"
+			agent.historyLoaded = false
 		} else {
 			agent.sessionID = lastID
+			agent.launchMode = "last"
 			if err := agent.loadSession(); err != nil {
 				return nil, fmt.Errorf("failed to load last session %s: %w", agent.sessionID, err)
 			}
+			agent.historyLoaded = true
 		}
 	} else {
+		agent.launchMode = "restore"
 		if err := agent.loadSession(); err != nil {
 			return nil, fmt.Errorf("failed to load session: %w", err)
 		}
+		agent.historyLoaded = true
 	}
 
 	// Register tools based on configuration
@@ -157,6 +168,11 @@ func NewAgent(options AgentOptions) (*Agent, error) {
 
 	if agent.maxTurns == 0 {
 		agent.maxTurns = 50
+	}
+
+	// Log launch info in JSON mode
+	if agent.jsonOutput {
+		agent.logLaunchInfo()
 	}
 
 	return agent, nil
@@ -174,7 +190,8 @@ const maxToolResultLength = 200
 func (a *Agent) logToolResult(toolName string, resultJSON []byte) {
 	resultLen := len(resultJSON)
 
-	if resultLen <= maxToolResultLength {
+	// In JSON output mode, never truncate - we need valid JSON
+	if a.jsonOutput || resultLen <= maxToolResultLength {
 		a.logf("TOOL_RESULT", "%s\n", string(resultJSON))
 	} else {
 		truncated := string(resultJSON[:maxToolResultLength])
@@ -263,6 +280,22 @@ func (a *Agent) logEndTurn() {
 		"data": map[string]interface{}{
 			"session_id": a.sessionID,
 			"model":      a.modelKey,
+		},
+	}
+	jsonBytes, _ := json.Marshal(out)
+	fmt.Println(string(jsonBytes))
+}
+
+func (a *Agent) logLaunchInfo() {
+	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+	out := map[string]interface{}{
+		"timestamp": timestamp,
+		"type":      "launch",
+		"data": map[string]interface{}{
+			"session_id":     a.sessionID,
+			"history_file":   a.getSessionPath(),
+			"launch_mode":    a.launchMode,
+			"history_loaded": a.historyLoaded,
 		},
 	}
 	jsonBytes, _ := json.Marshal(out)
@@ -517,19 +550,21 @@ func (a *Agent) registerTools(registry *tools.ToolRegistry, cfg *config.AgentCon
 				subRegistry := tools.NewToolRegistry()
 				a.registerTools(subRegistry, a.config, workingDir, false, enabledTools)
 
-				subOpts := subagent.SubAgentOptions{
-					ParentID:            config.ParentID,
-					AgentType:           config.SubagentType,
-					LLM:                 subLLM,
-					Tools:               subRegistry.GetAll(),
-					MaxTurns:            50,
-					JSONOutput:          a.jsonOutput,
-					SoftTools:           a.modelConfig.SoftTools,
-					AgentContent:        config.AgentContent,
-					InitialConversation: config.InitialConversation,
-					ForkedPrompt:        config.ForkedPrompt,
-					Fork:                config.Fork,
-				}
+			subOpts := subagent.SubAgentOptions{
+				ID:                  config.ID,
+				ParentID:            config.ParentID,
+				AgentType:           config.SubagentType,
+				LLM:                 subLLM,
+				Tools:               subRegistry.GetAll(),
+				MaxTurns:            50,
+				JSONOutput:          a.jsonOutput,
+				SoftTools:           a.modelConfig.SoftTools,
+				AgentContent:        config.AgentContent,
+				InitialConversation: config.InitialConversation,
+				ForkedPrompt:        config.ForkedPrompt,
+				Fork:                config.Fork,
+				Resume:              config.Resume,
+			}
 				return subagent.NewSubAgent(subOpts), nil
 			},
 			workingDir,
@@ -586,6 +621,15 @@ func createLLM(modelConfig config.ModelConfig) (llms.Model, error) {
 		if modelConfig.BaseURL != "" {
 			opts = append(opts, openai.WithBaseURL(modelConfig.BaseURL))
 		}
+		// Set HTTP timeout (default 180s)
+		timeoutSecs := modelConfig.TimeoutSecs
+		if timeoutSecs == 0 {
+			timeoutSecs = 180
+		}
+		httpClient := &http.Client{
+			Timeout: time.Duration(timeoutSecs) * time.Second,
+		}
+		opts = append(opts, openai.WithHTTPClient(httpClient))
 		return openai.New(opts...)
 	case "anthropic":
 		opts := []anthropic.Option{
@@ -781,9 +825,19 @@ func (a *Agent) runAgenticLoop(ctx context.Context) error {
 		currentUsage := usage.ExtractUsage(choice.GenerationInfo)
 
 		// Add assistant message to conversation
+		// Include reasoning_content if present (required for reasoning models like DeepSeek)
 		contentParts := make([]llms.ContentPart, 0)
-		if choice.Content != "" {
-			contentParts = append(contentParts, llms.TextContent{Text: choice.Content})
+		if choice.Content != "" || choice.ReasoningContent != "" {
+			// For reasoning models, we must pass back reasoning_content even if empty
+			// Use "hmmm..." as fallback if ForceReasoningContent is enabled and content is empty
+			reasoningContent := choice.ReasoningContent
+			if a.modelConfig.ForceReasoningContent && reasoningContent == "" {
+				reasoningContent = "hmmm..."
+			}
+			contentParts = append(contentParts, llms.TextContent{
+				Text:             choice.Content,
+				ReasoningContent: reasoningContent,
+			})
 		}
 		// For soft tools, embed tool calls in content as text instead of separate parts
 		if a.modelConfig.SoftTools && len(choice.ToolCalls) > 0 {
@@ -796,7 +850,15 @@ func (a *Agent) runAgenticLoop(ctx context.Context) error {
 					sb.WriteString(tc.ID)
 				}
 			}
-			contentParts = []llms.ContentPart{llms.TextContent{Text: sb.String()}}
+			// Include reasoning content for soft tools mode as well
+			reasoningContent := choice.ReasoningContent
+			if a.modelConfig.ForceReasoningContent && reasoningContent == "" {
+				reasoningContent = "hmmm..."
+			}
+			contentParts = []llms.ContentPart{llms.TextContent{
+				Text:             sb.String(),
+				ReasoningContent: reasoningContent,
+			}}
 		} else {
 			// Always add ToolCall parts so we have the IDs for serialization
 			for _, tc := range choice.ToolCalls {
@@ -876,7 +938,7 @@ func (a *Agent) runAgenticLoop(ctx context.Context) error {
 			if choice.ToolCalls[i].FunctionCall.Name == "task" && a.jsonOutput {
 				var data map[string]interface{}
 				if err := json.Unmarshal(resultJSON, &data); err == nil {
-					if agentID, ok := data["agent_id"].(string); ok {
+					if agentID, ok := data["resume_instance_id"].(string); ok {
 						// Log a spawn event explicitly linked before the result
 						timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 						spawnOut := map[string]interface{}{

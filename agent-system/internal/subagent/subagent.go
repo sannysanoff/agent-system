@@ -43,6 +43,7 @@ type SubAgent struct {
 	softTools    bool
 	agentContent string
 	fork         bool // Whether this is a forked subagent
+	resume       bool // Whether this is a resumed subagent
 }
 
 // SubAgentOptions represents options for creating a subagent
@@ -56,9 +57,10 @@ type SubAgentOptions struct {
 	JSONOutput          bool
 	SoftTools           bool
 	AgentContent        string
-	InitialConversation []interface{} // Forked conversation from parent (optional)
+	InitialConversation []interface{} // Forked or resumed conversation (optional)
 	ForkedPrompt        string        // Special prompt for fork mode (optional)
 	Fork                bool          // Whether this is a forked subagent
+	Resume              bool          // Whether this is a resumed subagent
 }
 
 // NewSubAgent creates a new subagent
@@ -73,10 +75,10 @@ func NewSubAgent(options SubAgentOptions) *SubAgent {
 		id = uuid.New().String()
 	}
 
-	// Initialize conversation - either fork from parent or start fresh
+	// Initialize conversation - either fork/resume from parent or start fresh
 	var initialConv []llms.MessageContent
-	if options.Fork && len(options.InitialConversation) > 0 {
-		// Clone the parent's conversation
+	if (options.Fork || options.Resume) && len(options.InitialConversation) > 0 {
+		// Clone the conversation (forked from parent or loaded from session)
 		initialConv = make([]llms.MessageContent, len(options.InitialConversation))
 		for i, msg := range options.InitialConversation {
 			if lm, ok := msg.(llms.MessageContent); ok {
@@ -98,6 +100,7 @@ func NewSubAgent(options SubAgentOptions) *SubAgent {
 		softTools:    options.SoftTools,
 		agentContent: options.AgentContent,
 		fork:         options.Fork,
+		resume:       options.Resume,
 	}
 }
 
@@ -110,7 +113,8 @@ const maxToolResultLength = 200
 func (s *SubAgent) logToolResult(toolName string, resultJSON []byte) {
 	resultLen := len(resultJSON)
 
-	if resultLen <= maxToolResultLength {
+	// In JSON output mode, never truncate - we need valid JSON
+	if s.jsonOutput || resultLen <= maxToolResultLength {
 		s.logf("TOOL_RESULT", "%s\n", string(resultJSON))
 	} else {
 		truncated := string(resultJSON[:maxToolResultLength])
@@ -160,7 +164,13 @@ func (s *SubAgent) saveSession() error {
 		return err
 	}
 
-	data, err := json.MarshalIndent(s.conversation, "", "  ")
+	metadata := tools.SessionMetadata{
+		Version:      tools.CurrentSessionVersion,
+		SubagentType: s.agentType,
+		Conversation: s.conversation,
+	}
+
+	data, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -187,9 +197,9 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 		s.maxTurns = maxTurns
 	}
 
-	// Build system prompt based on agent type (only if not forking)
+	// Build system prompt based on agent type (only if not forking or resuming)
 	systemPrompt := ""
-	if !s.fork {
+	if !s.fork && !s.resume {
 		systemPrompt = s.buildSystemPrompt()
 	}
 
@@ -198,9 +208,9 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 		// Normal mode: start fresh with system prompt
 		s.addMessage(llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt))
 		s.addMessage(llms.TextParts(llms.ChatMessageTypeHuman, prompt))
-	} else if s.fork {
-		// Fork mode: conversation is already cloned from parent
-		// Just append the forked prompt as a new user message
+	} else if s.fork || s.resume {
+		// Fork or resume mode: conversation is already loaded (from parent or session file)
+		// Just append the prompt as a new user message
 		s.addMessage(llms.TextParts(llms.ChatMessageTypeHuman, prompt))
 	}
 
@@ -236,10 +246,14 @@ func (s *SubAgent) Execute(ctx context.Context, prompt string, maxTurns int) (to
 		currentUsage := usage.ExtractUsage(choice.GenerationInfo)
 
 		// Add assistant message
+		// Include reasoning_content if present (required for reasoning models like DeepSeek)
 		contentParts := make([]llms.ContentPart, 0)
 		softToolError := len(choice.ToolCalls) == 0 && hasSoftToolMarkers(choice.Content)
-		if choice.Content != "" {
-			contentParts = append(contentParts, llms.TextContent{Text: choice.Content})
+		if choice.Content != "" || choice.ReasoningContent != "" {
+			contentParts = append(contentParts, llms.TextContent{
+				Text:             choice.Content,
+				ReasoningContent: choice.ReasoningContent,
+			})
 			if !softToolError {
 				s.logfWithMeta("ASSISTANT", &currentUsage, nil, "%s\n", choice.Content)
 			}

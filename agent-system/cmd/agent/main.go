@@ -66,6 +66,10 @@ func main() {
 		}
 		return
 	}
+	if agentResult == "INVALID" {
+		// Invalid agent name provided - fail hard
+		os.Exit(1)
+	}
 
 	flag.Parse()
 
@@ -222,7 +226,7 @@ func isListModelsFlag() bool {
 }
 
 // checkAgentFlag checks if -a flag is provided and returns action needed
-// Returns: "LIST" to list agents, "VALID" to use provided agent, "NONE" to skip
+// Returns: "LIST" to list agents, "VALID" to use provided agent, "INVALID" for invalid agent, "NONE" to skip
 func checkAgentFlag(agentName string, workingDir string) string {
 	args := os.Args[1:]
 	for i, arg := range args {
@@ -233,7 +237,7 @@ func checkAgentFlag(agentName string, workingDir string) string {
 				providedName := args[i+1]
 				if !agentExists(providedName, workingDir) {
 					fmt.Fprintf(os.Stderr, "Error: Agent '%s' not found\n\n", providedName)
-					return "LIST" // List available agents
+					return "INVALID" // Invalid agent - fail hard
 				}
 				return "VALID"
 			}
