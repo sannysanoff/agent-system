@@ -50,14 +50,25 @@ type ToolCall struct {
 
 // ToolRegistry manages all available tools
 type ToolRegistry struct {
-	tools map[string]Tool
-	mu    sync.RWMutex
+	tools         map[string]Tool
+	outputHandler *OutputHandler
+	mu            sync.RWMutex
 }
 
 // NewToolRegistry creates a new tool registry
 func NewToolRegistry() *ToolRegistry {
 	return &ToolRegistry{
 		tools: make(map[string]Tool),
+	}
+}
+
+// SetSessionsDir sets the sessions directory for output handling
+// This enables automatic writing of large tool outputs to files
+func (r *ToolRegistry) SetSessionsDir(dir string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if dir != "" {
+		r.outputHandler = NewOutputHandler(dir)
 	}
 }
 
@@ -105,6 +116,14 @@ func (r *ToolRegistry) ExecuteTool(ctx context.Context, call ToolCall) (ToolResu
 
 	result, execErr := tool.Execute(ctx, call.Params)
 	result.Tool = call.Name
+
+	// Process large outputs by writing to files
+	r.mu.RLock()
+	if r.outputHandler != nil {
+		r.outputHandler.ProcessToolResult(&result, call.ID, call.Name)
+	}
+	r.mu.RUnlock()
+
 	return result, execErr
 }
 

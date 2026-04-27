@@ -10,6 +10,13 @@ import (
 	"strings"
 )
 
+// Line truncation thresholds for very long lines
+const (
+	singleLineThreshold   = 5 * 1024 // 5KB - threshold for truncating a single line
+	singleLinePrefixSize  = 4 * 1024 // 4KB - prefix to show
+	singleLineSuffixSize  = 1 * 1024 // 1KB - suffix to show
+)
+
 // ReadTool implements file reading functionality
 type ReadTool struct {
 	readLimit int
@@ -108,6 +115,21 @@ func (t *ReadTool) Execute(ctx context.Context, params json.RawMessage) (ToolRes
 	return t.readTextFile(absPath, readParams)
 }
 
+// truncateLongLine truncates a single line if it exceeds the threshold
+// Returns: truncated line with middle replaced by length indicator
+func truncateLongLine(line string) string {
+	lineLen := len(line)
+	if lineLen <= singleLineThreshold {
+		return line
+	}
+
+	// Line is too long, truncate it
+	prefix := line[:singleLinePrefixSize]
+	suffix := line[lineLen-singleLineSuffixSize:]
+	return fmt.Sprintf("%s...(middle of line truncated, full length=%d chars)...%s",
+		prefix, lineLen, suffix)
+}
+
 func (t *ReadTool) readDirectory(path string) (ToolResult, error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -186,7 +208,9 @@ func (t *ReadTool) readTextFile(path string, params ReadParams) (ToolResult, err
 				linesReadStart = currentLine
 			}
 			linesReadEnd = currentLine
-			output.WriteString(fmt.Sprintf("%d: %s\n", currentLine, line))
+			// Truncate very long lines
+			displayLine := truncateLongLine(line)
+			output.WriteString(fmt.Sprintf("%d: %s\n", currentLine, displayLine))
 			bytesRead += lineLen
 		}
 	}

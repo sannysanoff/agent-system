@@ -116,6 +116,9 @@ func NewAgent(options AgentOptions) (*Agent, error) {
 	// Create tool registry
 	toolRegistry := tools.NewToolRegistry()
 
+	// Set sessions directory for large output file storage
+	toolRegistry.SetSessionsDir(getSessionsDir())
+
 	// Create agent
 	agent := &Agent{
 		config:        cfg,
@@ -647,6 +650,10 @@ func createLLM(modelConfig config.ModelConfig) (llms.Model, error) {
 		// If model ID is an ARN, explicitly set provider to anthropic
 		if strings.HasPrefix(modelConfig.ModelID, "arn:aws:bedrock") {
 			opts = append(opts, bedrock.WithModelProvider("anthropic"))
+		}
+		// Enable cache points if configured
+		if modelConfig.CachePoints {
+			opts = append(opts, bedrock.WithCachePoints(true))
 		}
 		ctx := context.Background()
 		awsOpts := []func(*awsconfig.LoadOptions) error{}
